@@ -11,7 +11,7 @@ export interface CliDependencies {
   cwd?: string;
 }
 
-export function runCli(args: string[], deps: CliDependencies = {}): string {
+export async function runCli(args: string[], deps: CliDependencies = {}): Promise<string> {
   const command = args[0];
   const store = deps.store ?? new FileTaskStore(deps.cwd ?? process.cwd());
 
@@ -25,7 +25,7 @@ export function runCli(args: string[], deps: CliDependencies = {}): string {
       if (!input) {
         throw new Error('start 需要需求文本');
       }
-      return formatResult(runLeaderTask(input, { store, ...parseLeaderOptions(args) }));
+        return formatResult(await runLeaderTask(input, { store, ...parseLeaderOptions(args) }));
     }
     case 'resume': {
       const taskId = args[1];
@@ -33,14 +33,14 @@ export function runCli(args: string[], deps: CliDependencies = {}): string {
         throw new Error('resume 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-      return formatResult(resumeLeaderTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+        return formatResult(await resumeLeaderTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
     }
     case 'approve': {
       const taskId = args[1];
       if (!taskId) {
         throw new Error('approve 需要 taskId');
       }
-      return formatResult(approveLeaderTask(taskId, { store, ...parseLeaderOptions(args) }));
+        return formatResult(await approveLeaderTask(taskId, { store, ...parseLeaderOptions(args) }));
     }
     case 'resolve-block': {
       const taskId = args[1];
@@ -48,7 +48,7 @@ export function runCli(args: string[], deps: CliDependencies = {}): string {
         throw new Error('resolve-block 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-      return formatResult(resolveBlockedTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+        return formatResult(await resolveBlockedTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
     }
     default:
       throw new Error(`未知命令: ${command}`);
@@ -98,7 +98,7 @@ function formatResult(result: LeaderRunResult): string {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    console.log(runCli(process.argv.slice(2)));
+    console.log(await runCli(process.argv.slice(2)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
