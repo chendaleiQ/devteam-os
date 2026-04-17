@@ -42,6 +42,8 @@ export interface StateTransition {
   from: TaskState;
   to: TaskState;
   reason: string;
+  decisionReason?: string;
+  executionRule?: string;
 }
 
 export interface ApprovalRequest {
@@ -66,6 +68,37 @@ export interface DeliveryReport {
   validation: ValidationResult;
 }
 
+export type TestCommandSource = 'user' | 'repo_config' | 'package_scripts' | 'unknown';
+
+export interface TestCommandResolution {
+  command: string;
+  source: TestCommandSource;
+  reason: string;
+  blocked: boolean;
+}
+
+export interface WaitingSummary {
+  reason: string;
+  requestedInput: string;
+  resumeTargetState: TaskState;
+}
+
+export interface Checkpoint {
+  state: TaskState;
+  transitionCount: number;
+  artifactCount: number;
+  summary: string;
+}
+
+export interface MeetingResult {
+  topic: string;
+  roleSummaries: Partial<Record<Exclude<Role, 'leader'>, string>>;
+  decisions: string[];
+  risks: string[];
+  nextStep: TaskState;
+  needsOwnerDecision: boolean;
+}
+
 export interface Task {
   id: string;
   input: string;
@@ -77,6 +110,10 @@ export interface Task {
   approvalRequests: ApprovalRequest[];
   validation?: ValidationResult;
   deliveryReport?: DeliveryReport;
+  checkpoint?: Checkpoint;
+  waitingSummary?: WaitingSummary;
+  latestMeetingResult?: MeetingResult;
+  testCommandResolution?: TestCommandResolution;
 }
 
 export interface LeaderRunResult {

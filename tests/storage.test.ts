@@ -27,7 +27,24 @@ describe('file task store', () => {
       artifacts: [],
       agentRuns: [],
       transitions: [],
-      approvalRequests: []
+      approvalRequests: [],
+      checkpoint: {
+        state: 'blocked',
+        transitionCount: 1,
+        artifactCount: 2,
+        summary: '等待补充外部依赖'
+      },
+      waitingSummary: {
+        reason: '任务受阻，等待解除阻塞',
+        requestedInput: '补充缺失依赖、信息或资源后再恢复',
+        resumeTargetState: 'planning'
+      },
+      testCommandResolution: {
+        command: 'typecheck',
+        source: 'user',
+        reason: '使用用户指定测试命令',
+        blocked: false
+      }
     };
 
     store.save(task);

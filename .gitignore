@@ -1,3 +1,4 @@
 node_modules/
 dist/
 .devteam-os/
+.DS_Store

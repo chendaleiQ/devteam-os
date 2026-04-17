@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createSafeScriptRunner } from '../src/runner.js';
+import { createSafeScriptRunner, resolveTestCommand } from '../src/runner.js';
 
 describe('safe script runner', () => {
   it('拒绝不在 allowlist 内的脚本', () => {
@@ -54,5 +54,58 @@ describe('safe script runner', () => {
         shell: false
       }
     ]);
+  });
+});
+
+describe('test command resolution', () => {
+  it('用户指定命令优先', () => {
+    expect(resolveTestCommand({
+      userCommand: 'test',
+      repoConfigCommand: 'typecheck',
+      packageScripts: ['build']
+    })).toMatchObject({
+      command: 'test',
+      source: 'user',
+      blocked: false
+    });
+  });
+
+  it('repo 配置命令次之', () => {
+    expect(resolveTestCommand({
+      repoConfigCommand: 'typecheck',
+      packageScripts: ['test']
+    })).toMatchObject({
+      command: 'typecheck',
+      source: 'repo_config',
+      blocked: false
+    });
+  });
+
+  it('自动识别 package scripts 中的 typecheck/test/build', () => {
+    expect(resolveTestCommand({ packageScripts: ['lint', 'build'] })).toMatchObject({
+      command: 'build',
+      source: 'package_scripts',
+      blocked: false
+    });
+
+    expect(resolveTestCommand({ packageScripts: ['test', 'build'] })).toMatchObject({
+      command: 'test',
+      source: 'package_scripts',
+      blocked: false
+    });
+
+    expect(resolveTestCommand({ packageScripts: ['typecheck', 'test', 'build'] })).toMatchObject({
+      command: 'typecheck',
+      source: 'package_scripts',
+      blocked: false
+    });
+  });
+
+  it('无可用命令时 blocked', () => {
+    expect(resolveTestCommand({ packageScripts: ['lint'] })).toMatchObject({
+      command: '',
+      source: 'unknown',
+      blocked: true
+    });
   });
 });
