@@ -96,6 +96,10 @@ function hasOwnerDecisionSignal(input: MeetingInput, actions: Set<NextAction>): 
     return true;
   }
 
+  if (input.ownerConstraints.length > 0) {
+    return true;
+  }
+
   return Object.values(input.roleOutputs).some((output) => output?.needsOwnerDecision);
 }
 

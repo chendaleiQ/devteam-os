@@ -1052,7 +1052,9 @@ describe('agent protocol batch 1', () => {
   });
 
   it('planning should respect PM protocol needsOwnerDecision flag', async () => {
-    const result = await runLeaderTask('请评估预算冲突下的本地原型方案并给出执行路径');
+    const result = await runLeaderTask('请评估预算冲突下的本地原型方案并给出执行路径', {
+      executionBackend: 'legacy'
+    });
     const pmRun = result.task.agentRuns.find((run) => run.role === 'pm') as Record<string, unknown> | undefined;
 
     expect(pmRun?.needsOwnerDecision).toBe(true);

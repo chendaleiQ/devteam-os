@@ -9,12 +9,15 @@ import {
   createId,
   setWaitingSummary
 } from './artifacts.js';
+import type { ExternalExecutor } from './executors/index.js';
 import { runLeaderGraph } from './leader-graph.js';
 import type { LlmProviderConfig } from './llm/index.js';
 import { createSafeScriptRunner, type SafeScriptRunner } from './runner.js';
 import type { TaskStore } from './storage.js';
 
 export interface LeaderRunOptions {
+  executionBackend?: 'legacy' | 'external';
+  executor?: string | ExternalExecutor;
   forceMeeting?: boolean;
   forceOwnerDecision?: boolean;
   forceBlocked?: boolean;
@@ -32,6 +35,7 @@ export interface LeaderResumeOptions extends LeaderRunOptions {
 }
 
 const WORKSPACE_ENV_KEYS = [
+  'DEVTEAM_EXECUTOR',
   'DEVTEAM_LLM_PROVIDER',
   'DEVTEAM_LLM_MODEL',
   'OPENAI_API_KEY',
