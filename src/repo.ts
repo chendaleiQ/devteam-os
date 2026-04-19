@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+
+import type { PatchProposalChange } from './patch-proposal.js';
 
 export interface WorkspaceFileReadResult {
   absolutePath: string;
@@ -20,7 +22,12 @@ export interface WorkspaceChangeSummary {
   summary: string;
 }
 
+export interface WorkspaceApplyResult {
+  writtenFiles: string[];
+}
+
 const ignoredDirectoryNames = new Set(['node_modules', '.git', '.devteam-os']);
+const allowedWorkspaceChangeOperations = new Set(['add', 'update']);
 
 export function resolveWorkspacePath(workspaceRoot: string, requestedPath: string): string {
   const realWorkspaceRoot = realpathSync(workspaceRoot);
@@ -122,6 +129,41 @@ export function summarizeWorkspaceChanges(workspaceRoot: string): WorkspaceChang
     blocked: false,
     source: 'git_diff',
     summary: output || '当前 workspace 没有 git diff 变更'
+  };
+}
+
+export function applyWorkspaceChanges(workspaceRoot: string, changes: readonly PatchProposalChange[]): WorkspaceApplyResult {
+  const realWorkspaceRoot = realpathSync(workspaceRoot);
+  const plannedWrites = changes.map((change) => {
+    if (!allowedWorkspaceChangeOperations.has(change.operation)) {
+      throw new Error(`Unsupported workspace change operation: ${String(change.operation)}`);
+    }
+
+    const absolutePath = resolveWorkspacePath(realWorkspaceRoot, change.path);
+    const fileExists = existsSync(absolutePath);
+
+    if (change.operation === 'add' && fileExists) {
+      throw new Error(`Workspace add target already exists: ${change.path}`);
+    }
+
+    if (change.operation === 'update' && !fileExists) {
+      throw new Error(`Workspace update target does not exist: ${change.path}`);
+    }
+
+    return {
+      relativePath: change.path,
+      absolutePath,
+      content: change.content
+    };
+  });
+
+  for (const write of plannedWrites) {
+    mkdirSync(dirname(write.absolutePath), { recursive: true });
+    writeFileSync(write.absolutePath, write.content, 'utf8');
+  }
+
+  return {
+    writtenFiles: plannedWrites.map((write) => write.relativePath)
   };
 }
 

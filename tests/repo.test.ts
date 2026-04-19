@@ -1,9 +1,9 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { readWorkspaceFile, searchWorkspaceFiles, summarizeWorkspaceChanges } from '../src/repo.js';
+import { applyWorkspaceChanges, readWorkspaceFile, searchWorkspaceFiles, summarizeWorkspaceChanges } from '../src/repo.js';
 
 describe('repo workspace utilities', () => {
   const roots: string[] = [];
@@ -81,5 +81,88 @@ describe('repo workspace utilities', () => {
         preview: 'const keyword = "hello workspace";'
       }
     ]);
+  });
+
+  it('受控写入支持合法 add 与 update', () => {
+    const workspaceRoot = createWorkspace();
+    mkdirSync(join(workspaceRoot, 'src'));
+    writeFileSync(join(workspaceRoot, 'src', 'existing.ts'), 'export const value = 1;\n', 'utf8');
+
+    const result = applyWorkspaceChanges(workspaceRoot, [
+      {
+        path: 'src/new-file.ts',
+        operation: 'add',
+        purpose: '新增文件',
+        content: 'export const created = true;\n'
+      },
+      {
+        path: 'src/existing.ts',
+        operation: 'update',
+        purpose: '更新文件',
+        content: 'export const value = 2;\n'
+      }
+    ]);
+
+    expect(result.writtenFiles).toEqual(['src/new-file.ts', 'src/existing.ts']);
+    expect(readFileSync(join(workspaceRoot, 'src', 'new-file.ts'), 'utf8')).toBe('export const created = true;\n');
+    expect(readFileSync(join(workspaceRoot, 'src', 'existing.ts'), 'utf8')).toBe('export const value = 2;\n');
+  });
+
+  it('受控写入在 add 已存在文件时失败', () => {
+    const workspaceRoot = createWorkspace();
+    mkdirSync(join(workspaceRoot, 'src'));
+    writeFileSync(join(workspaceRoot, 'src', 'existing.ts'), 'export const value = 1;\n', 'utf8');
+
+    expect(() => applyWorkspaceChanges(workspaceRoot, [
+      {
+        path: 'src/existing.ts',
+        operation: 'add',
+        purpose: '错误 add',
+        content: 'export const value = 2;\n'
+      }
+    ])).toThrow(/already exists/i);
+  });
+
+  it('受控写入在 update 不存在文件时失败', () => {
+    const workspaceRoot = createWorkspace();
+    mkdirSync(join(workspaceRoot, 'src'));
+
+    expect(() => applyWorkspaceChanges(workspaceRoot, [
+      {
+        path: 'src/missing.ts',
+        operation: 'update',
+        purpose: '错误 update',
+        content: 'export const value = 2;\n'
+      }
+    ])).toThrow(/does not exist/i);
+  });
+
+  it('受控写入拦截 workspace 外路径', () => {
+    const workspaceRoot = createWorkspace();
+
+    expect(() => applyWorkspaceChanges(workspaceRoot, [
+      {
+        path: '../outside.ts',
+        operation: 'add',
+        purpose: '越界写入',
+        content: 'export const hacked = true;\n'
+      }
+    ])).toThrow(/workspace/i);
+  });
+
+  it('受控写入在运行时拒绝非法 operation', () => {
+    const workspaceRoot = createWorkspace();
+    mkdirSync(join(workspaceRoot, 'src'));
+    writeFileSync(join(workspaceRoot, 'src', 'existing.ts'), 'export const value = 1;\n', 'utf8');
+
+    expect(() => applyWorkspaceChanges(workspaceRoot, [
+      {
+        path: 'src/existing.ts',
+        operation: 'delete',
+        purpose: '非法操作',
+        content: ''
+      } as never
+    ])).toThrow(/unsupported|invalid|非法|operation/i);
+    expect(readFileSync(join(workspaceRoot, 'src', 'existing.ts'), 'utf8')).toBe('export const value = 1;\n');
   });
 });

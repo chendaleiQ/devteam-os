@@ -5,8 +5,8 @@ const transitionGraph: Record<TaskState, TaskState[]> = {
   clarifying: ['planning', 'blocked'],
   planning: ['meeting', 'developing', 'awaiting_owner_decision', 'blocked'],
   meeting: ['developing', 'awaiting_owner_decision', 'blocked'],
-  developing: ['testing'],
-  testing: ['developing', 'reporting'],
+  developing: ['meeting', 'testing', 'awaiting_owner_decision', 'blocked'],
+  testing: ['developing', 'meeting', 'reporting', 'awaiting_owner_decision', 'blocked'],
   reporting: ['awaiting_owner_decision', 'done'],
   awaiting_owner_decision: ['planning', 'developing', 'done', 'blocked'],
   blocked: ['clarifying', 'planning'],
@@ -72,10 +72,28 @@ export function advanceState(
       }
       return 'developing';
     case 'developing':
+      if (options?.isBlocked) {
+        return 'blocked';
+      }
+      if (options?.needsMeeting) {
+        return 'meeting';
+      }
+      if (options?.needsOwnerDecision) {
+        return 'awaiting_owner_decision';
+      }
       return 'testing';
     case 'testing':
       if (!options?.validationResult) {
         throw new Error('testing 阶段推进需要 validationResult');
+      }
+      if (options?.isBlocked) {
+        return 'blocked';
+      }
+      if (options?.needsMeeting) {
+        return 'meeting';
+      }
+      if (options?.needsOwnerDecision) {
+        return 'awaiting_owner_decision';
       }
       return getTestingNextState(options.validationResult);
     case 'reporting':
