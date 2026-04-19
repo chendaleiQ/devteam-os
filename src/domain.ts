@@ -1,4 +1,6 @@
 export type Role = 'leader' | 'pm' | 'architect' | 'developer' | 'qa';
+export type ExecutorPhase = 'developing' | 'testing';
+export type ExecutorRunState = 'submitted' | 'running' | 'completed' | 'blocked' | 'failed';
 
 export type TaskState =
   | 'intake'
@@ -62,6 +64,8 @@ export type ArtifactKind =
   | 'blocker_report'
   | 'role_input_snapshot'
   | 'role_output'
+  | 'executor_request'
+  | 'executor_result'
   | 'risk_assessment'
   | 'loopback_note'
   | 'context_summary';
@@ -143,6 +147,14 @@ export interface Checkpoint {
   artifactIds?: string[];
 }
 
+export interface ExecutorSession {
+  executor: string;
+  runId: string;
+  phase: ExecutorPhase;
+  status: ExecutorRunState;
+  summary: string;
+}
+
 export interface MeetingRoleOutput {
   summary: string;
   riskLevel: RiskLevel;
@@ -189,6 +201,7 @@ export interface Task {
   waitingSummary?: WaitingSummary;
   latestMeetingResult?: MeetingResult;
   testCommandResolution?: TestCommandResolution;
+  executorSession?: ExecutorSession;
 }
 
 export interface LeaderRunResult {

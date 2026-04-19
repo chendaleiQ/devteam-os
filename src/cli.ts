@@ -269,12 +269,25 @@ function getNextStepHint(state: LeaderRunResult['task']['state']): string {
 
 function parseLeaderOptions(args: string[]): LeaderRunOptions {
   const verify = args.find((arg) => arg.startsWith('--verify='));
+  const executor = getOptionValue(args, '--executor');
+  const backend = getOptionValue(args, '--backend');
+
+  const options: LeaderRunOptions = {};
+
+  if (executor) {
+    options.executor = executor;
+  }
+
+  if (backend === 'legacy' || backend === 'external') {
+    options.executionBackend = backend;
+  }
 
   if (!verify) {
-    return {};
+    return options;
   }
 
   return {
+    ...options,
     verificationScripts: verify
       .slice('--verify='.length)
       .split(',')

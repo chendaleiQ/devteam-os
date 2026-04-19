@@ -163,6 +163,8 @@ function collectKeyArtifactIds(task: Task): string[] {
     'test_report',
     'meeting_notes',
     'blocker_report',
+    'executor_request',
+    'executor_result',
     'risk_assessment',
     'loopback_note',
     'context_summary',

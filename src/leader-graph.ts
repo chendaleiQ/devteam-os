@@ -25,6 +25,7 @@ import {
   createLoopbackArtifact,
   setWaitingSummary
 } from './artifacts.js';
+import { resolveExternalExecutor, type ExecutorArtifacts, type ExecutorPhase, type ExecutorRoleOutput, type ExecutorRunStatus, type ExecutorTaskInput } from './executors/index.js';
 import { createMeetingArtifact, createMeetingResult, type MeetingRoleSummaries } from './meeting.js';
 import { parsePatchProposal } from './patch-proposal.js';
 import { applyWorkspaceChanges } from './repo.js';
@@ -122,10 +123,11 @@ function runClarifyingNode(task: Task, options: LeaderRunOptions): Task {
 }
 
 async function runPlanningNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  const useLegacyExecution = shouldUseLegacyExecution(options);
   const shouldRunPm = !task.agentRuns.some((run) => run.role === 'pm')
     || hasArtifactUpdateSince(task, ['requirements_brief'], ['implementation_plan']);
 
-  if (shouldRunPm) {
+  if (useLegacyExecution && shouldRunPm) {
     if (task.agentRuns.some((run) => run.role === 'pm')) {
       addArtifact(
         task,
@@ -140,7 +142,22 @@ async function runPlanningNode(task: Task, options: LeaderRunOptions): Promise<T
     await runAndRecordAgent(task, 'pm', 'planning', '输出可执行实施计划并识别审批需求', options);
   }
 
-  const pmDecision = getLatestRoleRun(task, 'pm');
+  if (!useLegacyExecution && shouldRunPm) {
+    if (task.artifacts.some((artifact) => artifact.kind === 'implementation_plan')) {
+      addArtifact(
+        task,
+        createLoopbackArtifact('requirements_changed', '需求变化回流', 'leader', {
+          fromState: task.state,
+          toState: 'planning',
+          reason: '老板补充说明已更新，需重新生成治理层执行计划'
+        })
+      );
+    }
+
+    addArtifact(task, createGovernancePlanArtifact(task));
+  }
+
+  const pmDecision = useLegacyExecution ? getLatestRoleRun(task, 'pm') : undefined;
   const routing = decidePlanningRoute(
     task.input,
     options,
@@ -254,6 +271,14 @@ function runMeetingNode(task: Task, options: LeaderRunOptions): Task {
 }
 
 async function runDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  if (!shouldUseLegacyExecution(options)) {
+    return runExternalDevelopingNode(task, options);
+  }
+
+  return runLegacyDevelopingNode(task, options);
+}
+
+async function runLegacyDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
   const retryAfterFailedValidation = hasFailedValidation(task);
   const shouldRunArchitect = !task.agentRuns.some((run) => run.role === 'architect')
     || hasArtifactUpdateSince(task, ['implementation_plan'], ['architecture_note']);
@@ -330,6 +355,14 @@ async function runDevelopingNode(task: Task, options: LeaderRunOptions): Promise
 }
 
 async function runTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  if (!shouldUseLegacyExecution(options)) {
+    return runExternalTestingNode(task, options);
+  }
+
+  return runLegacyTestingNode(task, options);
+}
+
+async function runLegacyTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
   const retryAfterFailedValidation = hasFailedValidation(task);
   const shouldRunQa = !task.agentRuns.some((run) => run.role === 'qa')
     || retryAfterFailedValidation
@@ -354,6 +387,160 @@ async function runTestingNode(task: Task, options: LeaderRunOptions): Promise<Ta
     testingEscalation?.reason ?? validation.summary,
     'testing'
   );
+  persistTask(task, options);
+
+  if (testingNextState === 'meeting') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('solution_conflict', '测试阶段方案冲突回流', 'leader', {
+        fromState: 'testing',
+        toState: 'meeting',
+        reason: testingEscalation?.reason ?? '测试阶段识别到方案冲突，需回到会议对齐'
+      })
+    );
+    persistTask(task, options);
+    return task;
+  }
+
+  if (testingNextState === 'awaiting_owner_decision') {
+    const escalationReason = testingEscalation?.reason ?? '测试阶段风险升级，需老板确认';
+    task.approvalRequests.push(createOwnerDecisionRequest(escalationReason, 'role_requested_owner_decision', 'high'));
+    addArtifact(
+      task,
+      createLoopbackArtifact('risk_escalated', '测试阶段风险升级', 'leader', {
+        fromState: 'testing',
+        toState: 'awaiting_owner_decision',
+        reason: escalationReason
+      })
+    );
+    pauseTask(task, {
+      reason: '测试阶段风险升级，等待老板决策',
+      requestedInput: '请老板确认是否接受当前风险并继续推进',
+      resumeTargetState: 'developing',
+      checkpointSummary: escalationReason,
+      validation: {
+        passed: false,
+        summary: '测试阶段风险升级，等待老板决策',
+        issues: [escalationReason]
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
+  if (testingNextState === 'developing') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('testing_failed', '测试失败回流', 'leader', {
+        fromState: 'testing',
+        toState: 'developing',
+        reason: validation.summary,
+        issues: validation.issues
+      })
+    );
+    task.deliveryReport = buildDeliveryReport(task, validation);
+    persistTask(task, options);
+  }
+
+  return task;
+}
+
+async function runExternalDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  const retryAfterFailedValidation = hasFailedValidation(task);
+  const shouldDispatchExecution = !task.agentRuns.some((run) => run.role === 'developer')
+    || retryAfterFailedValidation
+    || hasArtifactUpdateSince(task, ['implementation_plan', 'loopback_note'], ['code_summary', 'architecture_note']);
+
+  if (shouldDispatchExecution) {
+    const execution = await runExternalExecutorPhase(
+      task,
+      'developing',
+      retryAfterFailedValidation ? '根据失败验证结果补齐实现' : '完成当前实现任务',
+      options
+    );
+
+    if (execution.status.state === 'blocked' || execution.status.state === 'failed') {
+      return handleExternalExecutorFailure(task, execution.status, 'developing', options);
+    }
+  }
+
+  const developmentEscalation = getRoleEscalationDecision(task, ['architect', 'developer']);
+  if (developmentEscalation?.type === 'meeting') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('solution_conflict', '方案冲突回流', 'leader', {
+        fromState: 'developing',
+        toState: 'meeting',
+        reason: developmentEscalation.reason
+      })
+    );
+    moveTask(task, 'meeting', developmentEscalation.reason, 'developing');
+    persistTask(task, options);
+    return task;
+  }
+
+  if (developmentEscalation?.type === 'owner_decision') {
+    task.approvalRequests.push(
+      createOwnerDecisionRequest(developmentEscalation.reason, 'role_requested_owner_decision', 'high')
+    );
+    moveTask(task, 'awaiting_owner_decision', developmentEscalation.reason, 'developing');
+    addArtifact(
+      task,
+      createLoopbackArtifact('risk_escalated', '风险升级回流', 'leader', {
+        fromState: 'developing',
+        toState: 'awaiting_owner_decision',
+        reason: developmentEscalation.reason
+      })
+    );
+    pauseTask(task, {
+      reason: '开发阶段风险升级，等待老板决策',
+      requestedInput: '请老板确认是否继续当前实现方向',
+      resumeTargetState: 'developing',
+      checkpointSummary: developmentEscalation.reason,
+      validation: task.validation ?? {
+        passed: false,
+        summary: '开发阶段风险升级，等待老板决策',
+        issues: [developmentEscalation.reason]
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
+  moveTask(task, advanceState(task.state), '外部执行器已返回开发产物，进入测试', 'developing');
+  persistTask(task, options);
+  return task;
+}
+
+async function runExternalTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  const retryAfterFailedValidation = hasFailedValidation(task);
+  const shouldDispatchExecution = !task.agentRuns.some((run) => run.role === 'qa')
+    || retryAfterFailedValidation
+    || hasArtifactUpdateSince(task, ['code_summary', 'architecture_note', 'loopback_note'], ['test_report']);
+
+  let validation = task.validation ?? validateExternalPrototype(task);
+
+  if (shouldDispatchExecution) {
+    const execution = await runExternalExecutorPhase(task, 'testing', '执行验证并给出测试结论', options);
+
+    if (execution.status.state === 'blocked' || execution.status.state === 'failed') {
+      return handleExternalExecutorFailure(task, execution.status, 'testing', options);
+    }
+
+    task.testCommandResolution = createExternalExecutorResolution(execution.status.executor);
+    validation = validateExternalPrototype(task, execution.artifacts);
+  } else {
+    task.testCommandResolution = task.testCommandResolution ?? createExternalExecutorResolution(resolveExternalExecutor(options.executor).name);
+  }
+
+  task.validation = validation;
+  const testingEscalation = getRoleEscalationDecision(task, ['qa']);
+  const testingNextState = advanceState(task.state, {
+    validationResult: validation,
+    needsMeeting: testingEscalation?.type === 'meeting',
+    needsOwnerDecision: testingEscalation?.type === 'owner_decision'
+  });
+  moveTask(task, testingNextState, testingEscalation?.reason ?? validation.summary, 'testing');
   persistTask(task, options);
 
   if (testingNextState === 'meeting') {
@@ -564,6 +751,213 @@ function runVerificationScripts(options: LeaderRunOptions) {
 
   const runner = options.runner ?? createSafeScriptRunner({ ...(options.packageJsonPath ? { packageJsonPath: options.packageJsonPath } : {}) });
   return [runner.runScript(resolution.command)];
+}
+
+async function runExternalExecutorPhase(
+  task: Task,
+  phase: ExecutorPhase,
+  requestedOutcome: string,
+  options: LeaderRunOptions
+): Promise<{ status: ExecutorRunStatus; artifacts?: ExecutorArtifacts }> {
+  const executor = resolveExternalExecutor(options.executor);
+  const input = createExecutorTaskInput(task, phase, requestedOutcome);
+  addArtifact(
+    task,
+    createArtifact(
+      'executor_request',
+      `外部执行请求 (${phase})`,
+      'leader',
+      JSON.stringify(
+        {
+          executor: executor.name,
+          phase,
+          requestedOutcome,
+          contextSummary: input.contextSummary,
+          riskSignals: input.riskSignals
+        },
+        null,
+        2
+      )
+    )
+  );
+
+  const submission = await executor.submitTask(input);
+  task.executorSession = {
+    executor: submission.executor,
+    runId: submission.runId,
+    phase: submission.phase,
+    status: 'submitted',
+    summary: submission.summary
+  };
+
+  const status = await executor.pollRun(submission.runId);
+  task.executorSession = {
+    executor: status.executor,
+    runId: status.runId,
+    phase: status.phase,
+    status: status.state,
+    summary: status.summary
+  };
+  addArtifact(
+    task,
+    createArtifact(
+      'executor_result',
+      `外部执行状态 (${phase})`,
+      'leader',
+      JSON.stringify(status, null, 2)
+    )
+  );
+
+  if (status.state !== 'completed') {
+    return { status };
+  }
+
+  const artifacts = await executor.collectArtifacts(submission.runId);
+  addArtifact(
+    task,
+    createArtifact(
+      'executor_result',
+      `外部执行结果 (${phase})`,
+      'leader',
+      JSON.stringify(
+        {
+          summary: artifacts.summary,
+          links: artifacts.links ?? []
+        },
+        null,
+        2
+      )
+    )
+  );
+
+  for (const roleOutput of artifacts.roleOutputs) {
+    recordExecutorRoleOutput(task, roleOutput);
+  }
+
+  return { status, artifacts };
+}
+
+function recordExecutorRoleOutput(task: Task, output: ExecutorRoleOutput): void {
+  const artifact = createArtifact(output.artifact.kind, output.artifact.title, output.role, output.artifact.content);
+  recordAgentOutput(task, {
+    role: output.role,
+    summary: output.summary,
+    confidence: output.confidence,
+    riskLevel: output.riskLevel,
+    risks: output.risks,
+    needsOwnerDecision: output.needsOwnerDecision,
+    nextAction: output.nextAction,
+    artifact,
+    ...(output.failureReason ? { failureReason: output.failureReason } : {})
+  });
+  addArtifact(
+    task,
+    createArtifact(
+      'role_output',
+      `${output.role} 输出快照`,
+      output.role,
+      JSON.stringify(
+        {
+          summary: output.summary,
+          confidence: output.confidence,
+          riskLevel: output.riskLevel,
+          risks: output.risks,
+          needsOwnerDecision: output.needsOwnerDecision,
+          nextAction: output.nextAction
+        },
+        null,
+        2
+      )
+    )
+  );
+}
+
+function createExecutorTaskInput(task: Task, phase: ExecutorPhase, requestedOutcome: string): ExecutorTaskInput {
+  const riskSignals = collectTaskRiskSignals(task);
+
+  return {
+    taskId: task.id,
+    taskSummary: task.input,
+    phase,
+    currentStatus: task.state,
+    artifacts: task.artifacts,
+    contextSummary: summarizeTaskContext(task, riskSignals),
+    riskSignals,
+    requestedOutcome
+  };
+}
+
+function handleExternalExecutorFailure(
+  task: Task,
+  status: ExecutorRunStatus,
+  currentNode: TaskState,
+  options: LeaderRunOptions
+): Task {
+  const reason = status.blockingReason ?? status.failureReason ?? '外部执行器未能完成当前阶段';
+  moveTask(task, 'blocked', reason, currentNode);
+  addArtifact(task, createBlockerArtifact(task.input, reason));
+  pauseTask(task, {
+    reason: '外部执行器未能继续推进，等待补充信息或切换执行策略',
+    requestedInput: '请补充执行约束、修正配置或切换执行器后再恢复',
+    resumeTargetState: 'planning',
+    checkpointSummary: reason,
+    validation: {
+      passed: false,
+      summary: '外部执行器未能继续推进，任务暂停',
+      issues: [reason]
+    }
+  });
+  persistTask(task, options);
+  return task;
+}
+
+function validateExternalPrototype(task: Task, executionArtifacts?: ExecutorArtifacts): ValidationResult {
+  if (executionArtifacts?.validation) {
+    return executionArtifacts.validation;
+  }
+
+  const hasPlan = task.artifacts.some((artifact) => artifact.kind === 'implementation_plan');
+  const hasCodeSummary = task.artifacts.some((artifact) => artifact.kind === 'code_summary');
+  const hasTestReport = task.artifacts.some((artifact) => artifact.kind === 'test_report');
+  const passed = hasPlan && hasCodeSummary && hasTestReport;
+
+  return {
+    passed,
+    summary: passed ? '外部执行器验证通过，进入汇报' : '外部执行器验证失败，回流开发补齐产物',
+    issues: passed ? [] : ['缺少计划、实现或测试产物，无法形成完整外部执行闭环']
+  };
+}
+
+function createExternalExecutorResolution(executorName: string): TestCommandResolution {
+  return {
+    command: `executor:${executorName}`,
+    source: 'unknown',
+    reason: `验证由外部执行器 ${executorName} 执行`,
+    blocked: false
+  };
+}
+
+function createGovernancePlanArtifact(task: Task): Artifact {
+  return createArtifact(
+    'implementation_plan',
+    'Leader 执行计划',
+    'leader',
+    JSON.stringify(
+      {
+        goal: task.input,
+        executionModel: 'external_executor',
+        nextSteps: [
+          '由 Leader 先完成治理判断与风险筛查',
+          '将开发执行委托给接入的外部执行器',
+          '回收开发、测试、PR 或摘要产物',
+          '根据结果决定汇报、回流或审批'
+        ],
+        knownRisks: collectInputRiskSignals(task.input).map((signal) => signal.description)
+      },
+      null,
+      2
+    )
+  );
 }
 
 function recordAgentOutput(task: Task, output: AgentRunOutput): void {
@@ -834,6 +1228,22 @@ function createAgentExecutionOptions(options: LeaderRunOptions): AgentExecutionO
     llm: options.llm ?? {},
     workspaceRoot: options.workspaceRoot ?? process.cwd()
   };
+}
+
+function shouldUseLegacyExecution(options: LeaderRunOptions): boolean {
+  if (options.executionBackend === 'legacy') {
+    return true;
+  }
+
+  if (options.executionBackend === 'external') {
+    return false;
+  }
+
+  return hasConfiguredLlmProvider(options.llm ?? {})
+    || Boolean(options.runner)
+    || Boolean(options.verificationScripts?.length)
+    || Boolean(options.repoConfigVerificationScript)
+    || Boolean(options.packageJsonPath);
 }
 
 function summarizeTaskContext(task: Task, riskSignals: RiskSignal[] = collectTaskRiskSignals(task)): string {

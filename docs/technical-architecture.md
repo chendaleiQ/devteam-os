@@ -1,5 +1,7 @@
 # DevTeamOS 技术架构
 
+> 说明：本文档主要记录 DevTeamOS 此前“内建执行栈原型”阶段的技术架构。自 2026-04-19 起，项目主方向已收缩为“Leader 治理层 + 外部执行器接入”；新的模块边界与收缩计划以 `docs/governance-layer-refactor-checklist.md`、`docs/project-overview.md`、`docs/development-roadmap.md` 为准。
+
 ## 1. 架构目标
 
 技术架构需要支撑四件事：

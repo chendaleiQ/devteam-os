@@ -114,12 +114,12 @@ describe('leader second batch branches', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('标准路径按 pm/architect/developer/qa 顺序产出 agentRuns 与角色 artifact', async () => {
+  it('标准路径默认走治理层 + 外部执行器，并产出核心角色 artifact', async () => {
     const result = await runLeaderTask('请实现一个本地 JSON 落盘与恢复的 TypeScript 原型');
 
     expect(result.paused).toBe(false);
     expect(result.task.state).toBe('done');
-    expect(result.task.agentRuns.map((run) => run.role)).toEqual(['pm', 'architect', 'developer', 'qa']);
+    expect(result.task.agentRuns.map((run) => run.role)).toEqual(['architect', 'developer', 'qa']);
 
     for (const run of result.task.agentRuns) {
       expect(run.producedArtifactIds).toHaveLength(1);
@@ -135,6 +135,8 @@ describe('leader second batch branches', () => {
     expect(result.task.artifacts.some((artifact) => artifact.kind === 'architecture_note')).toBe(true);
     expect(result.task.artifacts.some((artifact) => artifact.kind === 'code_summary')).toBe(true);
     expect(result.task.artifacts.some((artifact) => artifact.kind === 'test_report')).toBe(true);
+    expect(result.task.artifacts.some((artifact) => artifact.kind === 'executor_request')).toBe(true);
+    expect(result.task.artifacts.some((artifact) => artifact.kind === 'executor_result')).toBe(true);
   }, 15000);
 
   it('planning 在 forceMeeting 时进入 meeting 分支', async () => {
@@ -249,7 +251,7 @@ describe('leader second batch branches', () => {
     const result = await runLeaderTask('请实现一个本地 JSON 落盘与恢复的 TypeScript 原型');
 
     expect(result.task.deliveryReport?.artifactIds).toEqual(result.task.artifacts.map((artifact) => artifact.id));
-    expect(result.task.deliveryReport?.summary).toContain('基础验证通过，进入汇报');
+    expect(result.task.deliveryReport?.summary).toContain('外部执行器验证通过，进入汇报');
     expect(result.task.deliveryReport?.pendingItems).toEqual([]);
     expect(result.task.deliveryReport?.keyArtifactIds?.length).toBeGreaterThan(0);
   }, 15000);
@@ -418,7 +420,7 @@ describe('leader second batch branches', () => {
     });
   });
 
-  it('awaiting_owner_decision 任务 revise 后会回到 planning 并重新经过 PM', async () => {
+  it('awaiting_owner_decision 任务 revise 后会回到 planning 并重新生成治理层执行计划', async () => {
     const store = new InMemoryTaskStore();
     const result = await runLeaderTask('请设计一个需要老板拍板范围的本地原型增强', {
       forceOwnerDecision: true,
@@ -432,8 +434,9 @@ describe('leader second batch branches', () => {
 
     expect(revised.paused).toBe(false);
     expect(revised.task.state).toBe('done');
-    expect(revised.task.agentRuns.filter((run) => run.role === 'pm')).toHaveLength(2);
+    expect(revised.task.artifacts.filter((artifact) => artifact.kind === 'implementation_plan')).toHaveLength(2);
     expect(revised.task.artifacts.some((artifact) => artifact.title.includes('老板修改意见'))).toBe(true);
+    expect(revised.task.artifacts.some((artifact) => artifact.kind === 'loopback_note')).toBe(true);
     expect(revised.task.transitions.some((item) => item.from === 'awaiting_owner_decision' && item.to === 'planning')).toBe(true);
   });
 
@@ -455,7 +458,7 @@ describe('leader second batch branches', () => {
     expect([...resolved.task.transitions].reverse().find((item) => item.to === 'planning')?.executionRule).toBe('langgraph:blocked');
   }, 15000);
 
-  it('blocked 恢复后若老板补充了新要求，会重新经过 PM planning', async () => {
+  it('blocked 恢复后若老板补充了新要求，会重新生成治理层执行计划', async () => {
     const store = new InMemoryTaskStore();
     const blocked = await runLeaderTask('请实现一个当前依赖缺失的本地原型增强', {
       forceBlocked: true,
@@ -468,7 +471,7 @@ describe('leader second batch branches', () => {
     });
 
     expect(resolved.task.state).toBe('done');
-    expect(resolved.task.agentRuns.filter((run) => run.role === 'pm')).toHaveLength(2);
+    expect(resolved.task.artifacts.filter((artifact) => artifact.kind === 'implementation_plan')).toHaveLength(2);
     expect(resolved.task.artifacts.some((artifact) => artifact.kind === 'loopback_note')).toBe(true);
   });
 
