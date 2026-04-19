@@ -19,7 +19,13 @@ describe('workflow', () => {
 
 describe('leader minimal loop', () => {
   it('对清晰需求由 graph 推进到 done 并生成交付报告', async () => {
-    const result = await runLeaderTask('请做一个本地可运行的最小 TypeScript 原型骨架');
+    const result = await runLeaderTask('请做一个本地可运行的最小 TypeScript 原型骨架', {
+      runner: {
+        runScript(script) {
+          return { script, ok: true, blocked: false, summary: `ok ${script}` };
+        }
+      }
+    });
 
     expect(result.paused).toBe(false);
     expect(result.task.state).toBe('done');
@@ -50,7 +56,13 @@ describe('leader minimal loop', () => {
   });
 
   it('meeting 启发式时由 graph 从 planning 进入 meeting 分支', async () => {
-    const result = await runLeaderTask('请先组织一次会议评审这个本地原型增强再实现');
+    const result = await runLeaderTask('请先组织一次会议评审这个本地原型增强再实现', {
+      runner: {
+        runScript(script) {
+          return { script, ok: true, blocked: false, summary: `ok ${script}` };
+        }
+      }
+    });
 
     expect(result.task.transitions.map((item) => item.to)).toContain('meeting');
     expect(result.task.state).toBe('done');

@@ -5,6 +5,8 @@ import type {
   ApprovalRequest,
   Artifact,
   LeaderRunResult,
+  MeetingInput,
+  RiskSignal,
   StateTransition,
   Task,
   TaskState,
@@ -15,16 +17,23 @@ import { runAgent, type AgentRunOutput } from './agents/index.js';
 import {
   addArtifact,
   buildDeliveryReport,
+  captureTaskContextArtifacts,
   clearWaitingState,
   createArtifact,
   createCheckpoint,
   createId,
+  createLoopbackArtifact,
   setWaitingSummary
 } from './artifacts.js';
 import { createMeetingArtifact, createMeetingResult, type MeetingRoleSummaries } from './meeting.js';
+import { parsePatchProposal } from './patch-proposal.js';
+import { applyWorkspaceChanges } from './repo.js';
+import { classifyRisk, collectInputRiskSignals, collectTaskRiskSignals, shouldRequestOwnerDecision } from './risk.js';
 import { createSafeScriptRunner, resolveTestCommand } from './runner.js';
 import type { LeaderRunOptions } from './leader.js';
+import { hasConfiguredLlmProvider } from './llm/index.js';
 import { advanceState, assertValidTransition, isPauseState } from './workflow.js';
+import type { AgentExecutionOptions, AgentRunInput } from './agents/index.js';
 
 const LeaderGraphAnnotation = Annotation.Root({
   task: Annotation<Task>(),
@@ -36,10 +45,10 @@ type LeaderGraphState = typeof LeaderGraphAnnotation.State;
 const leaderGraph = new StateGraph(LeaderGraphAnnotation)
   .addNode('intake', async (state) => ({ task: runIntakeNode(state.task, state.options) }))
   .addNode('clarifying', async (state) => ({ task: runClarifyingNode(state.task, state.options) }))
-  .addNode('planning', async (state) => ({ task: runPlanningNode(state.task, state.options) }))
+  .addNode('planning', async (state) => ({ task: await runPlanningNode(state.task, state.options) }))
   .addNode('meeting', async (state) => ({ task: runMeetingNode(state.task, state.options) }))
-  .addNode('developing', async (state) => ({ task: runDevelopingNode(state.task, state.options) }))
-  .addNode('testing', async (state) => ({ task: runTestingNode(state.task, state.options) }))
+  .addNode('developing', async (state) => ({ task: await runDevelopingNode(state.task, state.options) }))
+  .addNode('testing', async (state) => ({ task: await runTestingNode(state.task, state.options) }))
   .addNode('reporting', async (state) => ({ task: runReportingNode(state.task, state.options) }))
   .addNode('awaiting_owner_decision', async (state) => ({ task: runAwaitingOwnerDecisionNode(state.task, state.options) }))
   .addNode('blocked', async (state) => ({ task: runBlockedNode(state.task, state.options) }))
@@ -112,12 +121,32 @@ function runClarifyingNode(task: Task, options: LeaderRunOptions): Task {
   return task;
 }
 
-function runPlanningNode(task: Task, options: LeaderRunOptions): Task {
-  if (!task.agentRuns.some((run) => run.role === 'pm')) {
-    recordAgentOutput(task, runAgent('pm', task.input));
+async function runPlanningNode(task: Task, options: LeaderRunOptions): Promise<Task> {
+  const shouldRunPm = !task.agentRuns.some((run) => run.role === 'pm')
+    || hasArtifactUpdateSince(task, ['requirements_brief'], ['implementation_plan']);
+
+  if (shouldRunPm) {
+    if (task.agentRuns.some((run) => run.role === 'pm')) {
+      addArtifact(
+        task,
+        createLoopbackArtifact('requirements_changed', '需求变化回流', 'leader', {
+          fromState: task.state,
+          toState: 'planning',
+          reason: '老板补充说明已更新，需重新经过 PM / planning'
+        })
+      );
+    }
+
+    await runAndRecordAgent(task, 'pm', 'planning', '输出可执行实施计划并识别审批需求', options);
   }
 
-  const routing = decidePlanningRoute(task.input, options);
+  const pmDecision = getLatestRoleRun(task, 'pm');
+  const routing = decidePlanningRoute(
+    task.input,
+    options,
+    pmDecision,
+    getLatestApprovalStatus(task) === 'changes_requested'
+  );
   const planningNextState = advanceState(task.state, {
     needsMeeting: routing.needsMeeting,
     needsOwnerDecision: routing.needsOwnerDecision,
@@ -144,11 +173,18 @@ function runPlanningNode(task: Task, options: LeaderRunOptions): Task {
   }
 
   if (planningNextState === 'awaiting_owner_decision') {
-    task.approvalRequests.push(createOwnerDecisionRequest('规划阶段需要老板拍板后再继续'));
+    const resumeTargetState = getOwnerDecisionResumeTarget(routing.approvalTrigger ?? 'role_requested_owner_decision');
+    task.approvalRequests.push(
+      createOwnerDecisionRequest(
+        routing.reason,
+        routing.approvalTrigger ?? 'role_requested_owner_decision',
+        routing.approvalRiskLevel
+      )
+    );
     pauseTask(task, {
       reason: '等待老板决策，任务暂停',
       requestedInput: '老板确认范围、优先级或方向',
-      resumeTargetState: 'developing',
+      resumeTargetState,
       checkpointSummary: '规划阶段已完成，等待老板拍板后继续',
       validation: {
         passed: false,
@@ -163,26 +199,52 @@ function runPlanningNode(task: Task, options: LeaderRunOptions): Task {
 }
 
 function runMeetingNode(task: Task, options: LeaderRunOptions): Task {
-  const meetingNeedsOwnerDecision = options.forceOwnerDecision ?? /老板拍板|老板决策|老板确认/u.test(task.input);
-  const roleSummaries = collectMeetingRoleSummaries(task.agentRuns);
-  task.latestMeetingResult = createMeetingResult(task.input, roleSummaries, meetingNeedsOwnerDecision);
-  addArtifact(task, createMeetingArtifact(task.input, roleSummaries, meetingNeedsOwnerDecision));
+  const meetingInput = createMeetingInput(task, options);
+  const meetingResult = createMeetingResult(meetingInput);
+  task.latestMeetingResult = meetingResult;
+  addArtifact(task, createMeetingArtifact(meetingInput, meetingResult));
 
-  const postMeetingState = advanceState(task.state, { needsOwnerDecision: meetingNeedsOwnerDecision, isBlocked: false });
-  moveTask(task, postMeetingState, meetingNeedsOwnerDecision ? '会议结论要求老板拍板' : '会议结论明确，可进入开发', 'meeting');
+  const postMeetingState = advanceState(task.state, {
+    needsOwnerDecision: meetingResult.needsOwnerDecision,
+    isBlocked: meetingResult.nextStep === 'blocked'
+  });
+  moveTask(task, postMeetingState, meetingResult.decisionReason, 'meeting');
   persistTask(task, options);
 
+  if (postMeetingState === 'blocked') {
+    pauseTask(task, {
+      reason: '会议确认存在阻塞条件，等待解除后再继续',
+      requestedInput: '请补齐缺失依赖或确认替代方案后恢复',
+      resumeTargetState: 'planning',
+      checkpointSummary: 'meeting 结论为 blocked，等待阻塞解除',
+      validation: {
+        passed: false,
+        summary: '会议识别到阻塞条件，任务暂停',
+        issues: meetingResult.risks.length > 0 ? meetingResult.risks : ['会议结论为 blocked']
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
   if (postMeetingState === 'awaiting_owner_decision') {
-    task.approvalRequests.push(createOwnerDecisionRequest('会议已形成方案，但需老板最终拍板'));
+    const approvalTrigger = 'multi_option_direction_change' as const;
+    task.approvalRequests.push(
+      createOwnerDecisionRequest(
+        '会议已形成方案，但需老板最终拍板',
+        approvalTrigger,
+        classifyRisk(collectTaskRiskSignals(task))
+      )
+    );
     pauseTask(task, {
       reason: '会议已完成，等待老板决策',
-      requestedInput: '老板最终拍板',
-      resumeTargetState: 'developing',
+      requestedInput: meetingResult.ownerQuestion ?? '老板最终拍板',
+      resumeTargetState: getOwnerDecisionResumeTarget(approvalTrigger),
       checkpointSummary: '会议已形成方案，等待老板最终决策',
       validation: {
         passed: false,
         summary: '会议已完成，等待老板决策',
-        issues: ['会议结论涉及老板拍板项']
+        issues: meetingResult.risks.length > 0 ? meetingResult.risks : ['会议结论涉及老板拍板项']
       }
     });
     persistTask(task, options);
@@ -191,14 +253,75 @@ function runMeetingNode(task: Task, options: LeaderRunOptions): Task {
   return task;
 }
 
-function runDevelopingNode(task: Task, options: LeaderRunOptions): Task {
+async function runDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
   const retryAfterFailedValidation = hasFailedValidation(task);
+  const shouldRunArchitect = !task.agentRuns.some((run) => run.role === 'architect')
+    || hasArtifactUpdateSince(task, ['implementation_plan'], ['architecture_note']);
+  const shouldRunDeveloper = !task.agentRuns.some((run) => run.role === 'developer')
+    || retryAfterFailedValidation
+    || hasArtifactUpdateSince(task, ['implementation_plan', 'architecture_note', 'loopback_note'], ['code_summary', 'patch_proposal']);
 
-  if (!task.agentRuns.some((run) => run.role === 'architect')) {
-    recordAgentOutput(task, runAgent('architect', task.input));
+  if (shouldRunArchitect) {
+    await runAndRecordAgent(task, 'architect', 'developing', '给出架构实现边界与方案', options);
   }
-  if (!task.agentRuns.some((run) => run.role === 'developer') || retryAfterFailedValidation) {
-    recordAgentOutput(task, runAgent('developer', task.input));
+  if (shouldRunDeveloper) {
+    await runAndRecordAgent(
+      task,
+      'developer',
+      'developing',
+      retryAfterFailedValidation ? '根据失败验证结果补齐实现' : '完成当前实现任务',
+      options
+    );
+  }
+
+  const developmentEscalation = getRoleEscalationDecision(task, ['architect', 'developer']);
+  if (developmentEscalation?.type === 'meeting') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('solution_conflict', '方案冲突回流', 'leader', {
+        fromState: 'developing',
+        toState: 'meeting',
+        reason: developmentEscalation.reason
+      })
+    );
+    moveTask(task, 'meeting', developmentEscalation.reason, 'developing');
+    persistTask(task, options);
+    return task;
+  }
+
+  if (developmentEscalation?.type === 'owner_decision') {
+    task.approvalRequests.push(
+      createOwnerDecisionRequest(developmentEscalation.reason, 'role_requested_owner_decision', 'high')
+    );
+    moveTask(task, 'awaiting_owner_decision', developmentEscalation.reason, 'developing');
+    addArtifact(
+      task,
+      createLoopbackArtifact('risk_escalated', '风险升级回流', 'leader', {
+        fromState: 'developing',
+        toState: 'awaiting_owner_decision',
+        reason: developmentEscalation.reason
+      })
+    );
+    pauseTask(task, {
+      reason: '开发阶段风险升级，等待老板决策',
+      requestedInput: '请老板确认是否继续当前实现方向',
+      resumeTargetState: 'developing',
+      checkpointSummary: developmentEscalation.reason,
+      validation: task.validation ?? {
+        passed: false,
+        summary: '开发阶段风险升级，等待老板决策',
+        issues: [developmentEscalation.reason]
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
+  const latestArtifact = getLatestArtifact(task, (artifact) => artifact.kind === 'patch_proposal');
+  if (latestArtifact?.kind === 'patch_proposal') {
+    const workspaceRoot = options.workspaceRoot ?? process.cwd();
+    const proposal = parsePatchProposal(latestArtifact.content, workspaceRoot);
+    applyWorkspaceChanges(workspaceRoot, proposal.changes);
   }
 
   moveTask(task, advanceState(task.state), '开发占位产物已生成，进入测试', 'developing');
@@ -206,21 +329,82 @@ function runDevelopingNode(task: Task, options: LeaderRunOptions): Task {
   return task;
 }
 
-function runTestingNode(task: Task, options: LeaderRunOptions): Task {
+async function runTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
   const retryAfterFailedValidation = hasFailedValidation(task);
+  const shouldRunQa = !task.agentRuns.some((run) => run.role === 'qa')
+    || retryAfterFailedValidation
+    || hasArtifactUpdateSince(task, ['code_summary', 'patch_proposal', 'loopback_note'], ['test_report']);
 
-  if (!task.agentRuns.some((run) => run.role === 'qa') || retryAfterFailedValidation) {
-    recordAgentOutput(task, runAgent('qa', task.input));
+  if (shouldRunQa) {
+    await runAndRecordAgent(task, 'qa', 'testing', '执行验证并给出测试结论', options);
   }
 
   task.testCommandResolution = resolveVerificationCommand(options);
   const validation = validatePrototype(task, options);
   task.validation = validation;
-  const testingNextState = advanceState(task.state, { validationResult: validation });
-  moveTask(task, testingNextState, validation.summary, 'testing');
+  const testingEscalation = getRoleEscalationDecision(task, ['qa']);
+  const testingNextState = advanceState(task.state, {
+    validationResult: validation,
+    needsMeeting: testingEscalation?.type === 'meeting',
+    needsOwnerDecision: testingEscalation?.type === 'owner_decision'
+  });
+  moveTask(
+    task,
+    testingNextState,
+    testingEscalation?.reason ?? validation.summary,
+    'testing'
+  );
   persistTask(task, options);
 
+  if (testingNextState === 'meeting') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('solution_conflict', '测试阶段方案冲突回流', 'leader', {
+        fromState: 'testing',
+        toState: 'meeting',
+        reason: testingEscalation?.reason ?? '测试阶段识别到方案冲突，需回到会议对齐'
+      })
+    );
+    persistTask(task, options);
+    return task;
+  }
+
+  if (testingNextState === 'awaiting_owner_decision') {
+    const escalationReason = testingEscalation?.reason ?? '测试阶段风险升级，需老板确认';
+    task.approvalRequests.push(createOwnerDecisionRequest(escalationReason, 'role_requested_owner_decision', 'high'));
+    addArtifact(
+      task,
+      createLoopbackArtifact('risk_escalated', '测试阶段风险升级', 'leader', {
+        fromState: 'testing',
+        toState: 'awaiting_owner_decision',
+        reason: escalationReason
+      })
+    );
+    pauseTask(task, {
+      reason: '测试阶段风险升级，等待老板决策',
+      requestedInput: '请老板确认是否接受当前风险并继续推进',
+      resumeTargetState: 'developing',
+      checkpointSummary: escalationReason,
+      validation: {
+        passed: false,
+        summary: '测试阶段风险升级，等待老板决策',
+        issues: [escalationReason]
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
   if (testingNextState === 'developing') {
+    addArtifact(
+      task,
+      createLoopbackArtifact('testing_failed', '测试失败回流', 'leader', {
+        fromState: 'testing',
+        toState: 'developing',
+        reason: validation.summary,
+        issues: validation.issues
+      })
+    );
     task.deliveryReport = buildDeliveryReport(task, validation);
     persistTask(task, options);
   }
@@ -239,7 +423,9 @@ function runReportingNode(task: Task, options: LeaderRunOptions): Task {
   moveTask(task, postReportingState, reportingNeedsOwnerDecision ? '汇报涉及老板最终拍板' : '汇报完成，任务结束', 'reporting');
 
   if (postReportingState === 'awaiting_owner_decision') {
-    task.approvalRequests.push(createOwnerDecisionRequest('汇报阶段需要老板确认是否按当前方案交付'));
+    task.approvalRequests.push(
+      createOwnerDecisionRequest('汇报阶段需要老板确认是否按当前方案交付', 'report_confirmation', 'medium')
+    );
     pauseTask(task, {
       reason: '已完成汇报，等待老板最终决策',
       requestedInput: '老板确认是否按当前方案交付',
@@ -256,6 +442,7 @@ function runReportingNode(task: Task, options: LeaderRunOptions): Task {
   }
 
   clearWaitingState(task);
+  captureTaskContextArtifacts(task, { title: '任务完成上下文摘要', reason: '任务进入 done' });
   task.deliveryReport = buildDeliveryReport(task, task.validation ?? {
     passed: true,
     summary: '已完成默认验证',
@@ -267,10 +454,52 @@ function runReportingNode(task: Task, options: LeaderRunOptions): Task {
 
 function runAwaitingOwnerDecisionNode(task: Task, options: LeaderRunOptions): Task {
   const pauseOrigin = getLastTransition(task)?.from;
+  const resumeTargetState = task.waitingSummary?.resumeTargetState;
+  const latestApprovalStatus = getLatestApprovalStatus(task);
   clearWaitingState(task);
 
-  if (pauseOrigin === 'reporting') {
+  if (latestApprovalStatus === 'rejected') {
+    moveTask(task, 'blocked', '老板驳回当前方案，等待新的方向或约束', 'awaiting_owner_decision');
+    addArtifact(
+      task,
+      createLoopbackArtifact('requirements_changed', '老板驳回后的回流', 'leader', {
+        fromState: 'awaiting_owner_decision',
+        toState: 'blocked',
+        reason: '老板驳回当前方案，需补充新的方向、范围或约束'
+      })
+    );
+    pauseTask(task, {
+      reason: '老板已驳回当前方案，等待新的方向或约束',
+      requestedInput: '请补充新的方向、范围或约束后再恢复推进',
+      resumeTargetState: 'planning',
+      checkpointSummary: '老板驳回当前方案，任务回到 blocked 等待新输入',
+      validation: {
+        passed: false,
+        summary: '老板已驳回当前方案，等待新的方向或约束',
+        issues: ['当前方案已被驳回，需重新规划']
+      }
+    });
+    persistTask(task, options);
+    return task;
+  }
+
+  if (latestApprovalStatus === 'changes_requested') {
+    moveTask(task, 'planning', '老板要求补充修改后重新规划', 'awaiting_owner_decision');
+    addArtifact(
+      task,
+      createLoopbackArtifact('requirements_changed', '老板要求补充修改', 'leader', {
+        fromState: 'awaiting_owner_decision',
+        toState: 'planning',
+        reason: '老板提出补充修改意见，需回到 planning 重新收敛方案'
+      })
+    );
+    persistTask(task, options);
+    return task;
+  }
+
+  if (pauseOrigin === 'reporting' || resumeTargetState === 'done') {
     moveTask(task, 'done', '老板已批准汇报结果，任务完成', 'awaiting_owner_decision');
+    captureTaskContextArtifacts(task, { title: '老板批准后的完成摘要', reason: '审批完成，任务结束' });
     task.deliveryReport = buildDeliveryReport(task, task.validation ?? {
       passed: true,
       summary: '老板批准后完成交付',
@@ -280,7 +509,15 @@ function runAwaitingOwnerDecisionNode(task: Task, options: LeaderRunOptions): Ta
     return task;
   }
 
-  moveTask(task, 'developing', '老板已批准，进入安全下一步开发', 'awaiting_owner_decision');
+  if (latestApprovalStatus === 'approved' && resumeTargetState === 'planning') {
+    task.input = normalizeTaskInputAfterOwnerApproval(task.input);
+    addArtifact(
+      task,
+      createArtifact('requirements_brief', '老板批准后的方向确认', 'leader', '老板已对方向/范围做出确认，任务回到 planning 继续推进')
+    );
+  }
+
+  moveTask(task, resumeTargetState ?? 'developing', '老板已批准，进入安全下一步开发', 'awaiting_owner_decision');
   persistTask(task, options);
   return task;
 }
@@ -294,7 +531,7 @@ function runBlockedNode(task: Task, options: LeaderRunOptions): Task {
 
 function validatePrototype(task: Task, options: LeaderRunOptions): ValidationResult {
   const hasPlan = task.artifacts.some((artifact) => artifact.kind === 'implementation_plan');
-  const hasCodeSummary = task.artifacts.some((artifact) => artifact.kind === 'code_summary');
+  const hasCodeSummary = task.artifacts.some((artifact) => artifact.kind === 'code_summary' || artifact.kind === 'patch_proposal');
   const hasTestReport = task.artifacts.some((artifact) => artifact.kind === 'test_report');
   const hasRequiredArtifacts = hasPlan && hasCodeSummary && hasTestReport;
   const resolution = task.testCommandResolution ?? resolveVerificationCommand(options);
@@ -335,6 +572,12 @@ function recordAgentOutput(task: Task, output: AgentRunOutput): void {
     id: createId('run'),
     role: output.role,
     summary: output.summary,
+    confidence: output.confidence,
+    riskLevel: output.riskLevel,
+    risks: output.risks,
+    needsOwnerDecision: output.needsOwnerDecision,
+    nextAction: output.nextAction,
+    ...(output.failureReason ? { failureReason: output.failureReason } : {}),
     producedArtifactIds: [output.artifact.id]
   };
   task.agentRuns.push(agentRun);
@@ -350,6 +593,52 @@ function collectMeetingRoleSummaries(agentRuns: AgentRun[]): MeetingRoleSummarie
   }
 
   return roleSummaries;
+}
+
+function createMeetingInput(task: Task, options: LeaderRunOptions): MeetingInput {
+  const roleOutputs = collectMeetingRoleOutputs(task.agentRuns);
+  const knownRisks = collectKnownRisks(task.agentRuns);
+  const defaultOwnerSignal = options.forceOwnerDecision ?? /老板拍板|老板决策|老板确认/u.test(task.input);
+  const ownerConstraints = defaultOwnerSignal ? ['请老板确认范围、优先级与交付方向'] : [];
+
+  return {
+    topic: task.input,
+    triggerReason: getLastTransition(task)?.reason ?? 'planning 识别到需要会议对齐',
+    roleOutputs,
+    knownRisks,
+    ownerConstraints
+  };
+}
+
+function collectMeetingRoleOutputs(agentRuns: AgentRun[]): MeetingInput['roleOutputs'] {
+  const roleOutputs: MeetingInput['roleOutputs'] = {};
+
+  for (const run of agentRuns) {
+    if (run.role === 'leader') {
+      continue;
+    }
+
+    roleOutputs[run.role] = {
+      summary: run.summary,
+      riskLevel: run.riskLevel ?? 'low',
+      risks: run.risks ?? [],
+      needsOwnerDecision: run.needsOwnerDecision ?? false,
+      nextAction: run.nextAction ?? 'continue'
+    };
+  }
+
+  return roleOutputs;
+}
+
+function collectKnownRisks(agentRuns: AgentRun[]): string[] {
+  const risks = new Set<string>();
+  for (const run of agentRuns) {
+    for (const risk of run.risks ?? []) {
+      risks.add(risk);
+    }
+  }
+
+  return [...risks];
 }
 
 function moveTask(task: Task, nextState: TaskState, reason: string, node: TaskState): void {
@@ -373,26 +662,66 @@ function createClarificationRequest(): ApprovalRequest {
     id: createId('approval'),
     reason: '请老板补充更清晰的交付目标、范围或约束',
     requestedBy: 'leader',
+    trigger: 'clarification_required',
+    riskLevel: 'medium',
     status: 'pending'
   };
 }
 
-function decidePlanningRoute(input: string, options: LeaderRunOptions): {
+function decidePlanningRoute(
+  input: string,
+  options: LeaderRunOptions,
+  pmDecision?: Pick<AgentRun, 'needsOwnerDecision' | 'nextAction' | 'risks'>,
+  suppressInputOwnerDecisionSignals = false
+): {
   needsMeeting: boolean;
   needsOwnerDecision: boolean;
   isBlocked: boolean;
   reason: string;
+  approvalTrigger?: ApprovalRequest['trigger'];
+  approvalRiskLevel: ApprovalRequest['riskLevel'];
 } {
+  const inputRiskSignals = collectInputRiskSignals(input, pmDecision);
+  const effectiveRiskSignals = suppressInputOwnerDecisionSignals
+    ? inputRiskSignals.filter((signal) => signal.trigger === 'role_requested_owner_decision')
+    : inputRiskSignals;
+  const ownerDecisionAssessment = shouldRequestOwnerDecision(effectiveRiskSignals);
+  const forcedOwnerDecision = options.forceOwnerDecision === true;
+  const approvalTriggerPart = ownerDecisionAssessment.trigger
+    ? { approvalTrigger: ownerDecisionAssessment.trigger }
+    : forcedOwnerDecision
+      ? { approvalTrigger: 'role_requested_owner_decision' as const }
+      : {};
+  const approvalRiskLevel = forcedOwnerDecision && ownerDecisionAssessment.riskLevel === 'low'
+    ? 'high'
+    : ownerDecisionAssessment.riskLevel;
   const needsMeeting = options.forceMeeting ?? /会议|评审|同步/u.test(input);
-  const needsOwnerDecision = options.forceOwnerDecision ?? /老板拍板|老板决策|老板确认/u.test(input);
+  const needsOwnerDecision = options.forceOwnerDecision ?? ownerDecisionAssessment.needsOwnerDecision;
   const isBlocked = options.forceBlocked ?? /阻塞|blocked|依赖缺失|缺少依赖/u.test(input);
+  const shouldConfirmBlockedInMeeting = needsMeeting && isBlocked && (
+    (options.forceMeeting === true && options.forceBlocked === true)
+    || /先.*(?:会议|评审)|会议评审|评审.*阻塞|确认阻塞/u.test(input)
+  );
+
+  if (shouldConfirmBlockedInMeeting) {
+    return {
+      needsMeeting: true,
+      needsOwnerDecision,
+      isBlocked: false,
+      reason: '规划阶段识别到需先开会确认阻塞结论',
+      ...approvalTriggerPart,
+      approvalRiskLevel
+    };
+  }
 
   if (isBlocked) {
     return {
       needsMeeting,
       needsOwnerDecision,
       isBlocked,
-      reason: '存在外部依赖缺失或阻塞条件，暂时无法继续'
+      reason: '存在外部依赖缺失或阻塞条件，暂时无法继续',
+      ...approvalTriggerPart,
+      approvalRiskLevel
     };
   }
 
@@ -401,7 +730,9 @@ function decidePlanningRoute(input: string, options: LeaderRunOptions): {
       needsMeeting,
       needsOwnerDecision,
       isBlocked,
-      reason: '规划阶段识别到需要先开会对齐'
+      reason: '规划阶段识别到需要先开会对齐',
+      ...approvalTriggerPart,
+      approvalRiskLevel
     };
   }
 
@@ -410,7 +741,9 @@ function decidePlanningRoute(input: string, options: LeaderRunOptions): {
       needsMeeting,
       needsOwnerDecision,
       isBlocked,
-      reason: '规划阶段存在需要老板拍板的关键选项'
+      reason: ownerDecisionAssessment.reason ?? pmDecision?.risks?.[0] ?? '规划阶段存在需要老板拍板的关键选项',
+      approvalTrigger: ownerDecisionAssessment.trigger ?? 'role_requested_owner_decision',
+      approvalRiskLevel
     };
   }
 
@@ -418,8 +751,210 @@ function decidePlanningRoute(input: string, options: LeaderRunOptions): {
     needsMeeting,
     needsOwnerDecision,
     isBlocked,
-    reason: '规划完成，进入开发'
+    reason: '规划完成，进入开发',
+    ...approvalTriggerPart,
+    approvalRiskLevel
   };
+}
+
+function createAgentRunInput(task: Task, currentStatus: TaskState, requestedOutcome: string): AgentRunInput {
+  const riskSignals = collectTaskRiskSignals(task);
+
+  return {
+    taskId: task.id,
+    taskSummary: task.input,
+    currentStatus,
+    artifacts: task.artifacts,
+    contextSummary: summarizeTaskContext(task, riskSignals),
+    riskSignals,
+    requestedOutcome
+  };
+}
+
+async function runAndRecordAgent(
+  task: Task,
+  role: Exclude<AgentRun['role'], 'leader'>,
+  currentStatus: TaskState,
+  requestedOutcome: string,
+  options: LeaderRunOptions
+): Promise<AgentRunOutput> {
+  const input = createAgentRunInput(task, currentStatus, requestedOutcome);
+  addArtifact(
+    task,
+    createArtifact(
+      'role_input_snapshot',
+      `${role} 输入快照`,
+      'leader',
+      JSON.stringify(
+        {
+          role,
+          currentStatus,
+          requestedOutcome,
+          contextSummary: input.contextSummary,
+          riskSignals: input.riskSignals
+        },
+        null,
+        2
+      )
+    )
+  );
+
+  const output = await runAgent(role, input, createAgentExecutionOptions(options));
+  recordAgentOutput(task, output);
+  addArtifact(
+    task,
+    createArtifact(
+      'role_output',
+      `${role} 输出快照`,
+      role,
+      JSON.stringify(
+        {
+          summary: output.summary,
+          confidence: output.confidence,
+          riskLevel: output.riskLevel,
+          risks: output.risks,
+          needsOwnerDecision: output.needsOwnerDecision,
+          nextAction: output.nextAction
+        },
+        null,
+        2
+      )
+    )
+  );
+
+  return output;
+}
+
+function createAgentExecutionOptions(options: LeaderRunOptions): AgentExecutionOptions | undefined {
+  if (!options.workspaceRoot && !hasConfiguredLlmProvider(options.llm ?? {})) {
+    return undefined;
+  }
+
+  return {
+    llm: options.llm ?? {},
+    workspaceRoot: options.workspaceRoot ?? process.cwd()
+  };
+}
+
+function summarizeTaskContext(task: Task, riskSignals: RiskSignal[] = collectTaskRiskSignals(task)): string {
+  const lastTransition = task.transitions.at(-1);
+  const statePart = `current=${task.state}`;
+  const transitionPart = lastTransition ? `last=${lastTransition.from}->${lastTransition.to}` : 'last=none';
+  return `${statePart}; ${transitionPart}; artifacts=${task.artifacts.length}; runs=${task.agentRuns.length}; risks=${riskSignals.length}`;
+}
+
+function getLatestArtifact(
+  task: Task,
+  predicate: (artifact: Task['artifacts'][number]) => boolean
+): Task['artifacts'][number] | undefined {
+  for (let i = task.artifacts.length - 1; i >= 0; i -= 1) {
+    const artifact = task.artifacts[i];
+    if (artifact && predicate(artifact)) {
+      return artifact;
+    }
+  }
+
+  return undefined;
+}
+
+function getLatestArtifactIndex(
+  task: Task,
+  predicate: (artifact: Task['artifacts'][number]) => boolean
+): number {
+  for (let i = task.artifacts.length - 1; i >= 0; i -= 1) {
+    const artifact = task.artifacts[i];
+    if (artifact && predicate(artifact)) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function hasArtifactUpdateSince(
+  task: Task,
+  sourceKinds: readonly Task['artifacts'][number]['kind'][],
+  targetKinds: readonly Task['artifacts'][number]['kind'][]
+): boolean {
+  const latestSourceIndex = getLatestArtifactIndex(task, (artifact) => sourceKinds.includes(artifact.kind));
+  const latestTargetIndex = getLatestArtifactIndex(task, (artifact) => targetKinds.includes(artifact.kind));
+  return latestSourceIndex > latestTargetIndex;
+}
+
+function getLatestRoleRun(task: Task, role: Exclude<AgentRun['role'], 'leader'>): AgentRun | undefined {
+  for (let i = task.agentRuns.length - 1; i >= 0; i -= 1) {
+    if (task.agentRuns[i]?.role === role) {
+      return task.agentRuns[i];
+    }
+  }
+
+  return undefined;
+}
+
+function getLatestApprovalStatus(task: Task): ApprovalRequest['status'] | undefined {
+  for (let i = task.approvalRequests.length - 1; i >= 0; i -= 1) {
+    const request = task.approvalRequests[i];
+    if (request) {
+      return request.status;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeTaskInputAfterOwnerApproval(input: string): string {
+  return input
+    .replace(/需要老板拍板|老板拍板|老板决策|老板确认/gu, '方向已确认')
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
+}
+
+function getRoleEscalationDecision(
+  task: Task,
+  roles: readonly Exclude<AgentRun['role'], 'leader'>[]
+): { type: 'meeting' | 'owner_decision'; reason: string } | undefined {
+  const latestEscalationArtifactIndex = getLatestArtifactIndex(
+    task,
+    (artifact) => artifact.kind === 'meeting_notes' || artifact.kind === 'loopback_note'
+  );
+
+  for (const role of roles) {
+    const run = getLatestRoleRun(task, role);
+    if (!run) {
+      continue;
+    }
+
+    const latestRoleArtifactIndex = getLatestArtifactIndex(
+      task,
+      (artifact) => artifact.createdBy === role
+        && (artifact.kind === 'role_output'
+          || artifact.kind === 'implementation_plan'
+          || artifact.kind === 'architecture_note'
+          || artifact.kind === 'code_summary'
+          || artifact.kind === 'patch_proposal'
+          || artifact.kind === 'test_report')
+    );
+
+    if (latestEscalationArtifactIndex > latestRoleArtifactIndex) {
+      continue;
+    }
+
+    if (run.nextAction === 'trigger_meeting' || run.risks?.some((risk) => /分歧|冲突/u.test(risk))) {
+      return {
+        type: 'meeting',
+        reason: `${role} 识别到方案冲突，需回到 meeting 对齐`
+      };
+    }
+
+    if (run.needsOwnerDecision || run.nextAction === 'request_owner_decision') {
+      return {
+        type: 'owner_decision',
+        reason: run.risks?.[0] ?? `${role} 识别到高风险事项，需老板确认`
+      };
+    }
+  }
+
+  return undefined;
 }
 
 function createBlockerArtifact(input: string, reason: string): Artifact {
@@ -439,13 +974,36 @@ function createBlockerArtifact(input: string, reason: string): Artifact {
   );
 }
 
-function createOwnerDecisionRequest(reason: string): ApprovalRequest {
+function createOwnerDecisionRequest(
+  reason: string,
+  trigger: ApprovalRequest['trigger'] = 'role_requested_owner_decision',
+  riskLevel: ApprovalRequest['riskLevel'] = 'high'
+): ApprovalRequest {
   return {
     id: createId('approval'),
     reason,
     requestedBy: 'leader',
+    trigger,
+    riskLevel,
     status: 'pending'
   };
+}
+
+function getOwnerDecisionResumeTarget(trigger: ApprovalRequest['trigger']): TaskState {
+  switch (trigger) {
+    case 'scope_change':
+    case 'acceptance_criteria_change':
+    case 'multi_option_direction_change':
+    case 'high_risk_command':
+    case 'destructive_operation':
+      return 'planning';
+    case 'report_confirmation':
+      return 'done';
+    case 'role_requested_owner_decision':
+    case 'clarification_required':
+    default:
+      return 'developing';
+  }
 }
 
 function shouldWaitForOwnerDecisionAtReporting(input: string, options: LeaderRunOptions): boolean {
@@ -471,7 +1029,12 @@ function pauseTask(
     requestedInput: options.requestedInput,
     resumeTargetState: options.resumeTargetState
   });
-  task.checkpoint = createCheckpoint(task, options.checkpointSummary);
+  task.validation = options.validation;
+  const checkpointArtifactIds = captureTaskContextArtifacts(task, {
+    title: '暂停上下文摘要',
+    reason: options.reason
+  });
+  task.checkpoint = createCheckpoint(task, options.checkpointSummary, checkpointArtifactIds);
   task.deliveryReport = buildDeliveryReport(task, options.validation);
 }
 

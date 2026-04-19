@@ -2,9 +2,9 @@ import { runArchitectAgent } from './architect.js';
 import { runDeveloperAgent } from './developer.js';
 import { runPmAgent } from './pm.js';
 import { runQaAgent } from './qa.js';
-import type { AgentAdapter, AgentRole, AgentRunOutput } from './types.js';
+import type { AgentAdapter, AgentExecutionOptions, AgentRole, AgentRunInput, AgentRunOutput } from './types.js';
 
-export type { AgentAdapter, AgentRole, AgentRunInput, AgentRunOutput } from './types.js';
+export type { AgentAdapter, AgentExecutionOptions, AgentRole, AgentRunInput, AgentRunOutput } from './types.js';
 
 export const agentRegistry: Record<AgentRole, AgentAdapter> = {
   pm: runPmAgent,
@@ -13,6 +13,6 @@ export const agentRegistry: Record<AgentRole, AgentAdapter> = {
   qa: runQaAgent
 };
 
-export function runAgent(role: AgentRole, input: string): AgentRunOutput {
-  return agentRegistry[role]({ input });
+export async function runAgent(role: AgentRole, input: AgentRunInput, options?: AgentExecutionOptions): Promise<AgentRunOutput> {
+  return await agentRegistry[role](input, options);
 }
