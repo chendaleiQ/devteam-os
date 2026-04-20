@@ -1,11 +1,21 @@
-import { MockExternalExecutor } from './mock.js';
+import { OpenHandsExternalExecutor } from './openhands.js';
 import type { ExternalExecutor } from './types.js';
 
-export type { ExternalExecutor, ExecutorArtifacts, ExecutorPhase, ExecutorRoleOutput, ExecutorRunState, ExecutorRunStatus, ExecutorSubmission, ExecutorTaskInput } from './types.js';
+export type {
+  ExternalExecutor,
+  ExecutorArtifacts,
+  ExecutorPhase,
+  ExecutorProgressEvent,
+  ExecutorProgressKind,
+  ExecutorRoleOutput,
+  ExecutorRunState,
+  ExecutorRunStatus,
+  ExecutorSubmission,
+  ExecutorTaskInput
+} from './types.js';
 
 const executorRegistry: Record<string, ExternalExecutor> = {
-  'mock-executor': new MockExternalExecutor(),
-  mock: new MockExternalExecutor()
+  openhands: new OpenHandsExternalExecutor()
 };
 
 export function resolveExternalExecutor(executor?: string | ExternalExecutor): ExternalExecutor {
@@ -13,7 +23,7 @@ export function resolveExternalExecutor(executor?: string | ExternalExecutor): E
     return executor;
   }
 
-  const requestedExecutor = executor ?? process.env.DEVTEAM_EXECUTOR ?? 'mock-executor';
+  const requestedExecutor = executor ?? process.env.DEVTEAM_EXECUTOR ?? 'openhands';
   const resolvedExecutor = executorRegistry[requestedExecutor];
 
   if (!resolvedExecutor) {

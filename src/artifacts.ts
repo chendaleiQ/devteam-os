@@ -158,7 +158,6 @@ function collectKeyArtifactIds(task: Task): string[] {
   const keyKinds = new Set<ArtifactKind>([
     'implementation_plan',
     'architecture_note',
-    'patch_proposal',
     'code_summary',
     'test_report',
     'meeting_notes',

@@ -13,7 +13,6 @@ import type {
   TestCommandResolution,
   ValidationResult,
 } from './domain.js';
-import { runAgent, type AgentRunOutput } from './agents/index.js';
 import {
   addArtifact,
   buildDeliveryReport,
@@ -25,16 +24,11 @@ import {
   createLoopbackArtifact,
   setWaitingSummary
 } from './artifacts.js';
-import { resolveExternalExecutor, type ExecutorArtifacts, type ExecutorPhase, type ExecutorRoleOutput, type ExecutorRunStatus, type ExecutorTaskInput } from './executors/index.js';
-import { createMeetingArtifact, createMeetingResult, type MeetingRoleSummaries } from './meeting.js';
-import { parsePatchProposal } from './patch-proposal.js';
-import { applyWorkspaceChanges } from './repo.js';
+import { resolveExternalExecutor, type ExecutorArtifacts, type ExecutorPhase, type ExecutorProgressEvent, type ExecutorRoleOutput, type ExecutorRunStatus, type ExecutorTaskInput } from './executors/index.js';
+import { createMeetingArtifact, createMeetingResult } from './meeting.js';
 import { classifyRisk, collectInputRiskSignals, collectTaskRiskSignals, shouldRequestOwnerDecision } from './risk.js';
-import { createSafeScriptRunner, resolveTestCommand } from './runner.js';
 import type { LeaderRunOptions } from './leader.js';
-import { hasConfiguredLlmProvider } from './llm/index.js';
 import { advanceState, assertValidTransition, isPauseState } from './workflow.js';
-import type { AgentExecutionOptions, AgentRunInput } from './agents/index.js';
 
 const LeaderGraphAnnotation = Annotation.Root({
   task: Annotation<Task>(),
@@ -123,45 +117,27 @@ function runClarifyingNode(task: Task, options: LeaderRunOptions): Task {
 }
 
 async function runPlanningNode(task: Task, options: LeaderRunOptions): Promise<Task> {
-  const useLegacyExecution = shouldUseLegacyExecution(options);
-  const shouldRunPm = !task.agentRuns.some((run) => run.role === 'pm')
+  const shouldRefreshPlan = !task.artifacts.some((artifact) => artifact.kind === 'implementation_plan')
     || hasArtifactUpdateSince(task, ['requirements_brief'], ['implementation_plan']);
 
-  if (useLegacyExecution && shouldRunPm) {
-    if (task.agentRuns.some((run) => run.role === 'pm')) {
-      addArtifact(
-        task,
-        createLoopbackArtifact('requirements_changed', '需求变化回流', 'leader', {
-          fromState: task.state,
-          toState: 'planning',
-          reason: '老板补充说明已更新，需重新经过 PM / planning'
-        })
-      );
-    }
-
-    await runAndRecordAgent(task, 'pm', 'planning', '输出可执行实施计划并识别审批需求', options);
+  if (shouldRefreshPlan && task.artifacts.some((artifact) => artifact.kind === 'implementation_plan')) {
+    addArtifact(
+      task,
+      createLoopbackArtifact('requirements_changed', '需求变化回流', 'leader', {
+        fromState: task.state,
+        toState: 'planning',
+        reason: '老板补充说明已更新，需重新生成治理层执行计划'
+      })
+    );
   }
 
-  if (!useLegacyExecution && shouldRunPm) {
-    if (task.artifacts.some((artifact) => artifact.kind === 'implementation_plan')) {
-      addArtifact(
-        task,
-        createLoopbackArtifact('requirements_changed', '需求变化回流', 'leader', {
-          fromState: task.state,
-          toState: 'planning',
-          reason: '老板补充说明已更新，需重新生成治理层执行计划'
-        })
-      );
-    }
-
+  if (shouldRefreshPlan) {
     addArtifact(task, createGovernancePlanArtifact(task));
   }
 
-  const pmDecision = useLegacyExecution ? getLatestRoleRun(task, 'pm') : undefined;
   const routing = decidePlanningRoute(
     task.input,
     options,
-    pmDecision,
     getLatestApprovalStatus(task) === 'changes_requested'
   );
   const planningNextState = advanceState(task.state, {
@@ -271,178 +247,11 @@ function runMeetingNode(task: Task, options: LeaderRunOptions): Task {
 }
 
 async function runDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
-  if (!shouldUseLegacyExecution(options)) {
-    return runExternalDevelopingNode(task, options);
-  }
-
-  return runLegacyDevelopingNode(task, options);
-}
-
-async function runLegacyDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
-  const retryAfterFailedValidation = hasFailedValidation(task);
-  const shouldRunArchitect = !task.agentRuns.some((run) => run.role === 'architect')
-    || hasArtifactUpdateSince(task, ['implementation_plan'], ['architecture_note']);
-  const shouldRunDeveloper = !task.agentRuns.some((run) => run.role === 'developer')
-    || retryAfterFailedValidation
-    || hasArtifactUpdateSince(task, ['implementation_plan', 'architecture_note', 'loopback_note'], ['code_summary', 'patch_proposal']);
-
-  if (shouldRunArchitect) {
-    await runAndRecordAgent(task, 'architect', 'developing', '给出架构实现边界与方案', options);
-  }
-  if (shouldRunDeveloper) {
-    await runAndRecordAgent(
-      task,
-      'developer',
-      'developing',
-      retryAfterFailedValidation ? '根据失败验证结果补齐实现' : '完成当前实现任务',
-      options
-    );
-  }
-
-  const developmentEscalation = getRoleEscalationDecision(task, ['architect', 'developer']);
-  if (developmentEscalation?.type === 'meeting') {
-    addArtifact(
-      task,
-      createLoopbackArtifact('solution_conflict', '方案冲突回流', 'leader', {
-        fromState: 'developing',
-        toState: 'meeting',
-        reason: developmentEscalation.reason
-      })
-    );
-    moveTask(task, 'meeting', developmentEscalation.reason, 'developing');
-    persistTask(task, options);
-    return task;
-  }
-
-  if (developmentEscalation?.type === 'owner_decision') {
-    task.approvalRequests.push(
-      createOwnerDecisionRequest(developmentEscalation.reason, 'role_requested_owner_decision', 'high')
-    );
-    moveTask(task, 'awaiting_owner_decision', developmentEscalation.reason, 'developing');
-    addArtifact(
-      task,
-      createLoopbackArtifact('risk_escalated', '风险升级回流', 'leader', {
-        fromState: 'developing',
-        toState: 'awaiting_owner_decision',
-        reason: developmentEscalation.reason
-      })
-    );
-    pauseTask(task, {
-      reason: '开发阶段风险升级，等待老板决策',
-      requestedInput: '请老板确认是否继续当前实现方向',
-      resumeTargetState: 'developing',
-      checkpointSummary: developmentEscalation.reason,
-      validation: task.validation ?? {
-        passed: false,
-        summary: '开发阶段风险升级，等待老板决策',
-        issues: [developmentEscalation.reason]
-      }
-    });
-    persistTask(task, options);
-    return task;
-  }
-
-  const latestArtifact = getLatestArtifact(task, (artifact) => artifact.kind === 'patch_proposal');
-  if (latestArtifact?.kind === 'patch_proposal') {
-    const workspaceRoot = options.workspaceRoot ?? process.cwd();
-    const proposal = parsePatchProposal(latestArtifact.content, workspaceRoot);
-    applyWorkspaceChanges(workspaceRoot, proposal.changes);
-  }
-
-  moveTask(task, advanceState(task.state), '开发占位产物已生成，进入测试', 'developing');
-  persistTask(task, options);
-  return task;
+  return runExternalDevelopingNode(task, options);
 }
 
 async function runTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
-  if (!shouldUseLegacyExecution(options)) {
-    return runExternalTestingNode(task, options);
-  }
-
-  return runLegacyTestingNode(task, options);
-}
-
-async function runLegacyTestingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
-  const retryAfterFailedValidation = hasFailedValidation(task);
-  const shouldRunQa = !task.agentRuns.some((run) => run.role === 'qa')
-    || retryAfterFailedValidation
-    || hasArtifactUpdateSince(task, ['code_summary', 'patch_proposal', 'loopback_note'], ['test_report']);
-
-  if (shouldRunQa) {
-    await runAndRecordAgent(task, 'qa', 'testing', '执行验证并给出测试结论', options);
-  }
-
-  task.testCommandResolution = resolveVerificationCommand(options);
-  const validation = validatePrototype(task, options);
-  task.validation = validation;
-  const testingEscalation = getRoleEscalationDecision(task, ['qa']);
-  const testingNextState = advanceState(task.state, {
-    validationResult: validation,
-    needsMeeting: testingEscalation?.type === 'meeting',
-    needsOwnerDecision: testingEscalation?.type === 'owner_decision'
-  });
-  moveTask(
-    task,
-    testingNextState,
-    testingEscalation?.reason ?? validation.summary,
-    'testing'
-  );
-  persistTask(task, options);
-
-  if (testingNextState === 'meeting') {
-    addArtifact(
-      task,
-      createLoopbackArtifact('solution_conflict', '测试阶段方案冲突回流', 'leader', {
-        fromState: 'testing',
-        toState: 'meeting',
-        reason: testingEscalation?.reason ?? '测试阶段识别到方案冲突，需回到会议对齐'
-      })
-    );
-    persistTask(task, options);
-    return task;
-  }
-
-  if (testingNextState === 'awaiting_owner_decision') {
-    const escalationReason = testingEscalation?.reason ?? '测试阶段风险升级，需老板确认';
-    task.approvalRequests.push(createOwnerDecisionRequest(escalationReason, 'role_requested_owner_decision', 'high'));
-    addArtifact(
-      task,
-      createLoopbackArtifact('risk_escalated', '测试阶段风险升级', 'leader', {
-        fromState: 'testing',
-        toState: 'awaiting_owner_decision',
-        reason: escalationReason
-      })
-    );
-    pauseTask(task, {
-      reason: '测试阶段风险升级，等待老板决策',
-      requestedInput: '请老板确认是否接受当前风险并继续推进',
-      resumeTargetState: 'developing',
-      checkpointSummary: escalationReason,
-      validation: {
-        passed: false,
-        summary: '测试阶段风险升级，等待老板决策',
-        issues: [escalationReason]
-      }
-    });
-    persistTask(task, options);
-    return task;
-  }
-
-  if (testingNextState === 'developing') {
-    addArtifact(
-      task,
-      createLoopbackArtifact('testing_failed', '测试失败回流', 'leader', {
-        fromState: 'testing',
-        toState: 'developing',
-        reason: validation.summary,
-        issues: validation.issues
-      })
-    );
-    task.deliveryReport = buildDeliveryReport(task, validation);
-    persistTask(task, options);
-  }
-
-  return task;
+  return runExternalTestingNode(task, options);
 }
 
 async function runExternalDevelopingNode(task: Task, options: LeaderRunOptions): Promise<Task> {
@@ -716,43 +525,6 @@ function runBlockedNode(task: Task, options: LeaderRunOptions): Task {
   return task;
 }
 
-function validatePrototype(task: Task, options: LeaderRunOptions): ValidationResult {
-  const hasPlan = task.artifacts.some((artifact) => artifact.kind === 'implementation_plan');
-  const hasCodeSummary = task.artifacts.some((artifact) => artifact.kind === 'code_summary' || artifact.kind === 'patch_proposal');
-  const hasTestReport = task.artifacts.some((artifact) => artifact.kind === 'test_report');
-  const hasRequiredArtifacts = hasPlan && hasCodeSummary && hasTestReport;
-  const resolution = task.testCommandResolution ?? resolveVerificationCommand(options);
-  const verificationResults = runVerificationScripts(options);
-  const passed = hasRequiredArtifacts && !resolution.blocked && Boolean(resolution.command) && verificationResults.every((result) => result.ok && !result.blocked);
-  const missingArtifactIssues = hasRequiredArtifacts ? [] : ['缺少必要的计划、实现或测试产物'];
-  const commandIssues = resolution.blocked || !resolution.command ? [`测试命令 blocked: ${resolution.reason}`] : [];
-  const verificationIssues = verificationResults.filter((result) => !result.ok || result.blocked).map((result) => result.summary);
-
-  return {
-    passed,
-    summary: passed ? '基础验证通过，进入汇报' : '基础验证失败，回流开发补齐产物',
-    issues: passed ? [] : [...missingArtifactIssues, ...commandIssues, ...verificationIssues]
-  };
-}
-
-function runVerificationScripts(options: LeaderRunOptions) {
-  const resolution = resolveVerificationCommand(options);
-
-  if (resolution.blocked || !resolution.command) {
-    return [
-      {
-        script: resolution.command,
-        ok: false,
-        blocked: true,
-        summary: resolution.reason
-      }
-    ];
-  }
-
-  const runner = options.runner ?? createSafeScriptRunner({ ...(options.packageJsonPath ? { packageJsonPath: options.packageJsonPath } : {}) });
-  return [runner.runScript(resolution.command)];
-}
-
 async function runExternalExecutorPhase(
   task: Task,
   phase: ExecutorPhase,
@@ -760,7 +532,13 @@ async function runExternalExecutorPhase(
   options: LeaderRunOptions
 ): Promise<{ status: ExecutorRunStatus; artifacts?: ExecutorArtifacts }> {
   const executor = resolveExternalExecutor(options.executor);
-  const input = createExecutorTaskInput(task, phase, requestedOutcome);
+  const input = createExecutorTaskInput(task, phase, requestedOutcome, options);
+  emitProgress(options, {
+    executor: executor.name,
+    phase,
+    kind: 'status',
+    message: `Leader 已将 ${phase} 阶段任务派发给 ${executor.name}`
+  });
   addArtifact(
     task,
     createArtifact(
@@ -782,6 +560,12 @@ async function runExternalExecutorPhase(
   );
 
   const submission = await executor.submitTask(input);
+  emitProgress(options, {
+    executor: submission.executor,
+    phase: submission.phase,
+    kind: 'status',
+    message: submission.summary
+  });
   task.executorSession = {
     executor: submission.executor,
     runId: submission.runId,
@@ -791,6 +575,12 @@ async function runExternalExecutorPhase(
   };
 
   const status = await executor.pollRun(submission.runId);
+  emitProgress(options, {
+    executor: status.executor,
+    phase: status.phase,
+    kind: status.state === 'completed' ? 'status' : 'error',
+    message: `${status.summary}${status.failureReason ? `: ${status.failureReason}` : status.blockingReason ? `: ${status.blockingReason}` : ''}`
+  });
   task.executorSession = {
     executor: status.executor,
     runId: status.runId,
@@ -872,7 +662,12 @@ function recordExecutorRoleOutput(task: Task, output: ExecutorRoleOutput): void 
   );
 }
 
-function createExecutorTaskInput(task: Task, phase: ExecutorPhase, requestedOutcome: string): ExecutorTaskInput {
+function createExecutorTaskInput(
+  task: Task,
+  phase: ExecutorPhase,
+  requestedOutcome: string,
+  options: LeaderRunOptions
+): ExecutorTaskInput {
   const riskSignals = collectTaskRiskSignals(task);
 
   return {
@@ -880,11 +675,17 @@ function createExecutorTaskInput(task: Task, phase: ExecutorPhase, requestedOutc
     taskSummary: task.input,
     phase,
     currentStatus: task.state,
+    workspaceRoot: options.workspaceRoot ?? process.cwd(),
     artifacts: task.artifacts,
     contextSummary: summarizeTaskContext(task, riskSignals),
     riskSignals,
-    requestedOutcome
+    requestedOutcome,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {})
   };
+}
+
+function emitProgress(options: LeaderRunOptions, event: ExecutorProgressEvent): void {
+  options.onProgress?.(event);
 }
 
 function handleExternalExecutorFailure(
@@ -931,7 +732,7 @@ function validateExternalPrototype(task: Task, executionArtifacts?: ExecutorArti
 function createExternalExecutorResolution(executorName: string): TestCommandResolution {
   return {
     command: `executor:${executorName}`,
-    source: 'unknown',
+    source: 'executor',
     reason: `验证由外部执行器 ${executorName} 执行`,
     blocked: false
   };
@@ -960,33 +761,31 @@ function createGovernancePlanArtifact(task: Task): Artifact {
   );
 }
 
-function recordAgentOutput(task: Task, output: AgentRunOutput): void {
+function recordAgentOutput(task: Task, output: {
+  role: Exclude<AgentRun['role'], 'leader'>;
+  summary: string;
+  confidence: number;
+  riskLevel: AgentRun['riskLevel'];
+  risks: string[];
+  needsOwnerDecision: boolean;
+  nextAction: AgentRun['nextAction'];
+  artifact: Artifact;
+  failureReason?: string;
+}): void {
   addArtifact(task, output.artifact);
   const agentRun: AgentRun = {
     id: createId('run'),
     role: output.role,
     summary: output.summary,
     confidence: output.confidence,
-    riskLevel: output.riskLevel,
     risks: output.risks,
     needsOwnerDecision: output.needsOwnerDecision,
-    nextAction: output.nextAction,
     ...(output.failureReason ? { failureReason: output.failureReason } : {}),
+    ...(output.riskLevel ? { riskLevel: output.riskLevel } : {}),
+    ...(output.nextAction ? { nextAction: output.nextAction } : {}),
     producedArtifactIds: [output.artifact.id]
   };
   task.agentRuns.push(agentRun);
-}
-
-function collectMeetingRoleSummaries(agentRuns: AgentRun[]): MeetingRoleSummaries {
-  const roleSummaries: MeetingRoleSummaries = {};
-
-  for (const run of agentRuns) {
-    if (run.role !== 'leader') {
-      roleSummaries[run.role] = run.summary;
-    }
-  }
-
-  return roleSummaries;
 }
 
 function createMeetingInput(task: Task, options: LeaderRunOptions): MeetingInput {
@@ -1065,7 +864,6 @@ function createClarificationRequest(): ApprovalRequest {
 function decidePlanningRoute(
   input: string,
   options: LeaderRunOptions,
-  pmDecision?: Pick<AgentRun, 'needsOwnerDecision' | 'nextAction' | 'risks'>,
   suppressInputOwnerDecisionSignals = false
 ): {
   needsMeeting: boolean;
@@ -1075,7 +873,7 @@ function decidePlanningRoute(
   approvalTrigger?: ApprovalRequest['trigger'];
   approvalRiskLevel: ApprovalRequest['riskLevel'];
 } {
-  const inputRiskSignals = collectInputRiskSignals(input, pmDecision);
+  const inputRiskSignals = collectInputRiskSignals(input);
   const effectiveRiskSignals = suppressInputOwnerDecisionSignals
     ? inputRiskSignals.filter((signal) => signal.trigger === 'role_requested_owner_decision')
     : inputRiskSignals;
@@ -1135,7 +933,7 @@ function decidePlanningRoute(
       needsMeeting,
       needsOwnerDecision,
       isBlocked,
-      reason: ownerDecisionAssessment.reason ?? pmDecision?.risks?.[0] ?? '规划阶段存在需要老板拍板的关键选项',
+      reason: ownerDecisionAssessment.reason ?? '规划阶段存在需要老板拍板的关键选项',
       approvalTrigger: ownerDecisionAssessment.trigger ?? 'role_requested_owner_decision',
       approvalRiskLevel
     };
@@ -1151,120 +949,11 @@ function decidePlanningRoute(
   };
 }
 
-function createAgentRunInput(task: Task, currentStatus: TaskState, requestedOutcome: string): AgentRunInput {
-  const riskSignals = collectTaskRiskSignals(task);
-
-  return {
-    taskId: task.id,
-    taskSummary: task.input,
-    currentStatus,
-    artifacts: task.artifacts,
-    contextSummary: summarizeTaskContext(task, riskSignals),
-    riskSignals,
-    requestedOutcome
-  };
-}
-
-async function runAndRecordAgent(
-  task: Task,
-  role: Exclude<AgentRun['role'], 'leader'>,
-  currentStatus: TaskState,
-  requestedOutcome: string,
-  options: LeaderRunOptions
-): Promise<AgentRunOutput> {
-  const input = createAgentRunInput(task, currentStatus, requestedOutcome);
-  addArtifact(
-    task,
-    createArtifact(
-      'role_input_snapshot',
-      `${role} 输入快照`,
-      'leader',
-      JSON.stringify(
-        {
-          role,
-          currentStatus,
-          requestedOutcome,
-          contextSummary: input.contextSummary,
-          riskSignals: input.riskSignals
-        },
-        null,
-        2
-      )
-    )
-  );
-
-  const output = await runAgent(role, input, createAgentExecutionOptions(options));
-  recordAgentOutput(task, output);
-  addArtifact(
-    task,
-    createArtifact(
-      'role_output',
-      `${role} 输出快照`,
-      role,
-      JSON.stringify(
-        {
-          summary: output.summary,
-          confidence: output.confidence,
-          riskLevel: output.riskLevel,
-          risks: output.risks,
-          needsOwnerDecision: output.needsOwnerDecision,
-          nextAction: output.nextAction
-        },
-        null,
-        2
-      )
-    )
-  );
-
-  return output;
-}
-
-function createAgentExecutionOptions(options: LeaderRunOptions): AgentExecutionOptions | undefined {
-  if (!options.workspaceRoot && !hasConfiguredLlmProvider(options.llm ?? {})) {
-    return undefined;
-  }
-
-  return {
-    llm: options.llm ?? {},
-    workspaceRoot: options.workspaceRoot ?? process.cwd()
-  };
-}
-
-function shouldUseLegacyExecution(options: LeaderRunOptions): boolean {
-  if (options.executionBackend === 'legacy') {
-    return true;
-  }
-
-  if (options.executionBackend === 'external') {
-    return false;
-  }
-
-  return hasConfiguredLlmProvider(options.llm ?? {})
-    || Boolean(options.runner)
-    || Boolean(options.verificationScripts?.length)
-    || Boolean(options.repoConfigVerificationScript)
-    || Boolean(options.packageJsonPath);
-}
-
 function summarizeTaskContext(task: Task, riskSignals: RiskSignal[] = collectTaskRiskSignals(task)): string {
   const lastTransition = task.transitions.at(-1);
   const statePart = `current=${task.state}`;
   const transitionPart = lastTransition ? `last=${lastTransition.from}->${lastTransition.to}` : 'last=none';
   return `${statePart}; ${transitionPart}; artifacts=${task.artifacts.length}; runs=${task.agentRuns.length}; risks=${riskSignals.length}`;
-}
-
-function getLatestArtifact(
-  task: Task,
-  predicate: (artifact: Task['artifacts'][number]) => boolean
-): Task['artifacts'][number] | undefined {
-  for (let i = task.artifacts.length - 1; i >= 0; i -= 1) {
-    const artifact = task.artifacts[i];
-    if (artifact && predicate(artifact)) {
-      return artifact;
-    }
-  }
-
-  return undefined;
 }
 
 function getLatestArtifactIndex(
@@ -1341,7 +1030,6 @@ function getRoleEscalationDecision(
           || artifact.kind === 'implementation_plan'
           || artifact.kind === 'architecture_note'
           || artifact.kind === 'code_summary'
-          || artifact.kind === 'patch_proposal'
           || artifact.kind === 'test_report')
     );
 
@@ -1446,14 +1134,6 @@ function pauseTask(
   });
   task.checkpoint = createCheckpoint(task, options.checkpointSummary, checkpointArtifactIds);
   task.deliveryReport = buildDeliveryReport(task, options.validation);
-}
-
-function resolveVerificationCommand(options: LeaderRunOptions): TestCommandResolution {
-  return resolveTestCommand({
-    ...(options.verificationScripts?.[0] ? { userCommand: options.verificationScripts[0] } : {}),
-    ...(options.repoConfigVerificationScript ? { repoConfigCommand: options.repoConfigVerificationScript } : {}),
-    ...(options.packageJsonPath ? { packageJsonPath: options.packageJsonPath } : {})
-  });
 }
 
 function hasFailedValidation(task: Task): boolean {

@@ -56,13 +56,11 @@ export type ArtifactKind =
   | 'implementation_plan'
   | 'architecture_note'
   | 'code_summary'
-  | 'patch_proposal'
   | 'test_report'
   | 'delivery_summary'
   | 'clarification_request'
   | 'meeting_notes'
   | 'blocker_report'
-  | 'role_input_snapshot'
   | 'role_output'
   | 'executor_request'
   | 'executor_result'
@@ -124,7 +122,7 @@ export interface DeliveryReport {
   validation: ValidationResult;
 }
 
-export type TestCommandSource = 'user' | 'repo_config' | 'package_scripts' | 'unknown';
+export type TestCommandSource = 'executor' | 'unknown';
 
 export interface TestCommandResolution {
   command: string;
