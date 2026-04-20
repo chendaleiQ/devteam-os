@@ -28,7 +28,14 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
   const io = deps.io ?? createDefaultCliIo();
 
   if (!command) {
-    throw new Error('用法: start "需求" | interactive [需求] | resume <taskId> --note "补充信息" | approve <taskId> | reject <taskId> [--note "说明"] | revise <taskId> --note "修改意见" | resolve-block <taskId> --note "说明"');
+    throw new Error(`用法: 
+  start "需求"                   创建并启动新任务
+  interactive [需求]             交互式会话
+  resume <taskId> --note "说明"  补充说明后继续
+  approve <taskId>               审批通过
+  reject <taskId> [--note "说明"] 审批驳回
+  revise <taskId> --note "说明"  请求修改
+  resolve-block <taskId> --note "说明" 解除阻塞`);
   }
 
   switch (command) {
