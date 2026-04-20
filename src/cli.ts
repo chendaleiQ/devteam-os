@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { loadProjectEnv } from './env.js';
 import { approveLeaderTask, rejectLeaderTask, requestChangesLeaderTask, resolveBlockedTask, resumeLeaderTask, runLeaderTask, type LeaderRunOptions } from './leader.js';
 import type { LeaderRunResult } from './domain.js';
+import type { ExecutorProgressEvent } from './executors/index.js';
 import { FileTaskStore, type TaskStore } from './storage.js';
 
 export interface CliDependencies {
@@ -36,7 +37,7 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
       if (!input) {
         throw new Error('start 需要需求文本');
       }
-        return formatResult(await runLeaderTask(input, { store, ...parseLeaderOptions(args) }));
+      return formatResult(await runLeaderTask(input, { store, ...createCliLeaderOptions(args, io) }));
     }
     case 'resume': {
       const taskId = args[1];
@@ -44,14 +45,14 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
         throw new Error('resume 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-        return formatResult(await resumeLeaderTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+      return formatResult(await resumeLeaderTask(taskId, { store, ...createCliLeaderOptions(args, io), ...(note ? { note } : {}) }));
     }
     case 'approve': {
       const taskId = args[1];
       if (!taskId) {
         throw new Error('approve 需要 taskId');
       }
-        return formatResult(await approveLeaderTask(taskId, { store, ...parseLeaderOptions(args) }));
+      return formatResult(await approveLeaderTask(taskId, { store, ...createCliLeaderOptions(args, io) }));
     }
     case 'reject': {
       const taskId = args[1];
@@ -59,7 +60,7 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
         throw new Error('reject 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-        return formatResult(await rejectLeaderTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+      return formatResult(await rejectLeaderTask(taskId, { store, ...createCliLeaderOptions(args, io), ...(note ? { note } : {}) }));
     }
     case 'revise': {
       const taskId = args[1];
@@ -67,7 +68,7 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
         throw new Error('revise 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-      return formatResult(await requestChangesLeaderTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+      return formatResult(await requestChangesLeaderTask(taskId, { store, ...createCliLeaderOptions(args, io), ...(note ? { note } : {}) }));
     }
     case 'resolve-block': {
       const taskId = args[1];
@@ -75,7 +76,7 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
         throw new Error('resolve-block 需要 taskId');
       }
       const note = getOptionValue(args, '--note');
-        return formatResult(await resolveBlockedTask(taskId, { store, ...parseLeaderOptions(args), ...(note ? { note } : {}) }));
+      return formatResult(await resolveBlockedTask(taskId, { store, ...createCliLeaderOptions(args, io), ...(note ? { note } : {}) }));
     }
     case 'interactive': {
       const transcript: string[] = [];
@@ -83,9 +84,9 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
         transcript.push(message);
         io.write(message);
       };
-      const options = { store, ...parseLeaderOptions(args) };
+      const options = { store, ...createCliLeaderOptions(args, { ...io, write }) };
 
-      const input = await getInteractiveInput(args.slice(1), io);
+      const input = await getInteractiveInput(args.slice(1), io, write);
       if (!input) {
         return transcript.join('\n');
       }
@@ -110,18 +111,25 @@ export async function runCli(args: string[], deps: CliDependencies = {}): Promis
   }
 }
 
-async function getInteractiveInput(args: string[], io: CliIO): Promise<string | undefined> {
+async function getInteractiveInput(args: string[], io: CliIO, write: (message: string) => void): Promise<string | undefined> {
   const positionalInput = getPositionalText(args);
   if (positionalInput) {
     return positionalInput;
   }
 
-  const promptedInput = (await io.prompt('请输入需求：'))?.trim();
-  if (!promptedInput || isExitInput(promptedInput)) {
-    return undefined;
-  }
+  while (true) {
+    const promptedInput = (await io.prompt('请输入需求（直接输入需求，exit/quit 退出）：'))?.trim();
+    if (promptedInput === undefined || isExitInput(promptedInput)) {
+      write('已退出当前交互会话。');
+      return undefined;
+    }
+    if (!promptedInput) {
+      write('无效输入：请输入需求，或输入 exit/quit 退出。');
+      continue;
+    }
 
-  return promptedInput;
+    return promptedInput;
+  }
 }
 
 function isExitInput(input: string): boolean {
@@ -156,7 +164,7 @@ async function continueInteractiveSession(
   write: (message: string) => void
 ): Promise<LeaderRunResult | undefined> {
   const { task } = result;
-  const promptText = `${task.waitingSummary?.requestedInput ?? getDefaultPausedPrompt(task.state)}：`;
+  const promptText = getInteractivePausedPrompt(task.state, task.waitingSummary?.requestedInput);
 
   switch (task.state) {
     case 'clarifying': {
@@ -234,11 +242,7 @@ async function continueInteractiveSession(
 }
 
 function writeInteractiveUpdate(result: LeaderRunResult, write: (message: string) => void): void {
-  write(formatResult(result));
-
-  if (result.paused) {
-    write(formatPausedStatus(result));
-  }
+  write(formatResult(result, { interactive: true }));
 }
 
 function getDefaultPausedPrompt(state: LeaderRunResult['task']['state']): string {
@@ -267,10 +271,24 @@ function getNextStepHint(state: LeaderRunResult['task']['state']): string {
   }
 }
 
+function getInteractivePausedPrompt(
+  state: LeaderRunResult['task']['state'],
+  requestedInput: string | undefined
+): string {
+  switch (state) {
+    case 'clarifying':
+      return `[clarifying] ${requestedInput ?? '请补充说明'}（直接输入内容，exit/quit 退出）：`;
+    case 'awaiting_owner_decision':
+      return '[awaiting_owner_decision] 请输入 approve / reject / revise（可直接输入，exit/quit 退出）：';
+    case 'blocked':
+      return `[blocked] ${requestedInput ?? '请提供解除阻塞说明'}（直接输入内容，exit/quit 退出）：`;
+    default:
+      return `${requestedInput ?? getDefaultPausedPrompt(state)}：`;
+  }
+}
+
 function parseLeaderOptions(args: string[]): LeaderRunOptions {
-  const verify = args.find((arg) => arg.startsWith('--verify='));
   const executor = getOptionValue(args, '--executor');
-  const backend = getOptionValue(args, '--backend');
 
   const options: LeaderRunOptions = {};
 
@@ -278,21 +296,15 @@ function parseLeaderOptions(args: string[]): LeaderRunOptions {
     options.executor = executor;
   }
 
-  if (backend === 'legacy' || backend === 'external') {
-    options.executionBackend = backend;
-  }
+  return options;
+}
 
-  if (!verify) {
-    return options;
-  }
-
+function createCliLeaderOptions(args: string[], io: Pick<CliIO, 'write'>): LeaderRunOptions {
   return {
-    ...options,
-    verificationScripts: verify
-      .slice('--verify='.length)
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean)
+    ...parseLeaderOptions(args),
+    onProgress(event) {
+      io.write(formatProgressEvent(event));
+    }
   };
 }
 
@@ -311,25 +323,59 @@ function getPositionalText(args: string[]): string {
   return args.filter((arg) => !arg.startsWith('--')).join(' ').trim();
 }
 
-function formatResult(result: LeaderRunResult): string {
+function formatResult(result: LeaderRunResult, options: { interactive?: boolean } = {}): string {
   const { task } = result;
-  return [
-    `taskId=${task.id}`,
-    `state=${task.state}`,
-    `paused=${result.paused ? 'yes' : 'no'}`,
-    `summary=${task.deliveryReport?.summary ?? task.validation?.summary ?? '无'}`
-  ].join(' ');
+  const lines = [
+    `=== Task ${task.id} ===`,
+    `State: ${task.state}${result.paused ? ' (paused)' : ''}`,
+    `Summary: ${task.deliveryReport?.summary ?? task.validation?.summary ?? '无'}`
+  ];
+
+  if (!result.paused) {
+    return lines.join('\n');
+  }
+
+  lines.push('');
+  lines.push(`Reason: ${task.waitingSummary?.reason ?? '无'}`);
+  lines.push(`Need: ${task.waitingSummary?.requestedInput ?? getDefaultPausedPrompt(task.state)}`);
+  lines.push(`Next: ${getNextStepHint(task.state)}`);
+
+  if (options.interactive) {
+    lines.push('Interactive: 可直接在当前会话输入，无需复制 Continue with 里的命令。');
+  }
+
+  const commands = getContinuationCommands(task.id, task.state);
+  if (commands.length > 0) {
+    lines.push('Continue with:');
+    lines.push(...commands.map((command) => `  ${command}`));
+  }
+
+  return lines.join('\n');
 }
 
-function formatPausedStatus(result: LeaderRunResult): string {
-  const { task } = result;
-  return [
-    'status=paused',
-    `state=${task.state}`,
-    `reason=${task.waitingSummary?.reason ?? '无'}`,
-    `requestedInput=${task.waitingSummary?.requestedInput ?? getDefaultPausedPrompt(task.state)}`,
-    `next=${getNextStepHint(task.state)}`
-  ].join(' ');
+function formatProgressEvent(event: ExecutorProgressEvent): string {
+  return `[progress][${event.phase}][${event.executor}][${event.kind}] ${sanitizeProgressMessage(event.message)}`;
+}
+
+function sanitizeProgressMessage(message: string): string {
+  return message.replace(/\s+/gu, ' ').trim();
+}
+
+function getContinuationCommands(taskId: string, state: LeaderRunResult['task']['state']): string[] {
+  switch (state) {
+    case 'clarifying':
+      return [`npm run dev -- resume ${taskId} --note "补充说明"`];
+    case 'awaiting_owner_decision':
+      return [
+        `npm run dev -- approve ${taskId}`,
+        `npm run dev -- reject ${taskId} --note "驳回原因"`,
+        `npm run dev -- revise ${taskId} --note "修改意见"`
+      ];
+    case 'blocked':
+      return [`npm run dev -- resolve-block ${taskId} --note "解除阻塞说明"`];
+    default:
+      return [];
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
