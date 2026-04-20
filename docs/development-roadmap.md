@@ -1,129 +1,94 @@
-# DevTeamOS 全项目阶段性目标与路线图
+# DevTeamOS 全项目路线图
 
-本文档说明 DevTeamOS 在 2026-04-19 战略收缩之后的新路线图。
+DevTeamOS 的主线已经确定：
 
-此前仓库已经验证过一轮“Leader 驱动的本地交付原型”和“团队协作能力增强”原型，这些工作证明了治理层语义是成立的；但后续不再继续沿着“自研完整 agent 平台”方向扩张。
+> **保留 `Leader` 治理层，把真实开发执行交给外部执行器。**
 
-新的主路线图聚焦：
+## 当前状态
 
-> **保留 Leader 治理层，停止扩张自研执行栈，并接入外部执行器。**
+截至 2026-04-19，当前仓库已经具备：
 
-## 总体判断标准
+- `Leader -> workflow -> artifact -> approval` 治理闭环
+- `clarifying / awaiting_owner_decision / blocked / reporting` 暂停恢复语义
+- `ExternalExecutor` 协议与 adapter registry
+- 默认 `OpenHands` 执行器
 
-DevTeamOS 的建设顺序不再是“把内建执行平台做完整”，而是按“先稳住治理内核，再接入外部执行器，再产品化治理视图”的路径推进。
+## 下一阶段
 
-每一阶段都应回答同一个问题：
+### Phase 1：执行器稳定化
 
-> 这一阶段，是否让 DevTeamOS 更接近一个可复用、可审计、可对接外部执行器的 AI 研发任务治理层？
+目标：
 
-## 当前基线
+- 让 `OpenHands` 成为稳定默认执行器
+- 提高失败可诊断性
+- 明确执行器输入/输出契约
+- 持续清理 mock / fake execution path，保证产品可用性只建立在真实执行链路上
 
-截至 2026-04-19，仓库已经完成两件重要但现在被重新定义的历史工作：
+范围：
 
-1. 验证了 `Leader -> workflow -> artifact -> approval` 的治理闭环是成立的。
-2. 验证了本地原型级别的执行链路可以跑通。
+- 开发/测试阶段的结果回收
+- 阻塞、失败、回流语义细化
+- 执行器结果 artifact 标准化
 
-新的判断是：
+完成标准：
 
-- 第 1 点应该被保留并继续做深。
-- 第 2 点已经足够完成“验证”职责，不应继续演化为长期主线架构。
+- 常见任务可稳定走完 `planning -> developing -> testing -> reporting -> done`
+- 执行器失败时，老板能看懂为什么停住
 
-## 新阶段划分
+### Phase 2：操作台收敛
 
-### Phase A：治理内核稳态化
+目标：
 
-#### 目标
+- 把 CLI 做成真正的 operator console
 
-把项目正式收缩为治理层，统一文档、模块边界和测试重点。
+范围：
 
-#### 范围
+- 展示任务状态
+- 展示等待原因
+- 展示执行器 session、artifact、测试结论
+- 简化审批与恢复操作
 
-- 保留 `Leader`、workflow、risk、artifact、checkpoint、approval
-- 冻结内部角色 agent 与 LLM/provider 扩张
-- 停止继续增强 repo/runner/patch proposal 主路径
-- 明确仓库中的“核心模块”和“遗留执行模块”
+完成标准：
 
-#### 完成标准
+- 不翻 JSON 也能完成任务推进
 
-- README / overview / roadmap 口径一致
-- 有明确的 keep / freeze / remove / replace 清单
-- 主线测试重点转向治理规则
+### Phase 3：多执行器接入
 
-### Phase B：外部执行器适配层
+目标：
 
-#### 目标
+- 在统一治理层下接更多执行器
 
-用统一接口接入至少一个外部执行器，替代自研执行栈。
+范围：
 
-#### 范围
+- 增加 `Open SWE` / `OpenHands` 之外的 adapter
+- 统一不同执行器的摘要、链接、PR、验证结果
 
-- 定义 `ExternalExecutor` 协议
-- 实现 adapter registry
-- 提供至少一个执行器接入
-- 将 `developing` / `testing` 主路径改为“派发 + 轮询 + 回收结果”
+完成标准：
 
-#### 完成标准
+- 更换执行器不需要改治理层主逻辑
 
-- 至少一条真实任务可以通过外部执行器完成
-- `Leader` 仍可触发审批、回流和汇报
-- 不再依赖自研 LLM provider 才能推进主线任务
+### Phase 4：生产协作接入
 
-### Phase C：治理视图与操作台
+目标：
 
-#### 目标
+- 接入真实团队工作流
 
-把 CLI 从“本地 coding 入口”收缩为“治理 operator console”，并补齐任务可视化。
-
-#### 范围
-
-- 任务状态视图
-- artifact 浏览
-- 审批处理
-- 外部执行器运行状态展示
-- 历史任务追踪
-
-#### 完成标准
-
-- 操作者可清楚看到任务当前状态、等待原因、外部执行器产物和下一步动作
-- 不需要阅读底层日志即可完成老板侧操作
-
-### Phase D：生产协作接入
-
-#### 目标
-
-把治理层接入真实团队工作流，而不是继续自建底层执行环境。
-
-#### 范围
+范围：
 
 - GitHub / Slack / Linear 等集成
-- PR / 运行状态 / 审批回路的审计能力
+- 审批、回流、汇报的审计能力
 - 执行器配置管理
-- 基础权限和审计边界
 
-#### 完成标准
+完成标准：
 
-- DevTeamOS 可作为现有外部 agent 平台之上的治理层工作
-- 团队能复用其审批、汇报、回流和 artifact 机制
+- DevTeamOS 可作为外部 agent 平台之上的治理层使用
 
-## 明确停止投入的方向
+## 不再投入的方向
 
-以下方向不再作为主线建设目标：
+以下方向不再作为主线：
 
-- 自研 LLM provider 覆盖面继续扩张
-- 自研 patch proposal 协议继续增强
-- 自研 repo runtime / command runner 继续做重
-- 自研 PM / Architect / Developer / QA 执行器继续产品化
+- 自研模型 provider
+- 自研 PM / Architect / Developer / QA 执行器
+- 自研 patch proposal 协议
+- 自研 repo runtime / command runner
 - 以“完整自建 agent 平台”为目标继续推进
-
-## 当前重点
-
-当前应优先完成：
-
-1. 文档定位统一
-2. 模块 keep / freeze / remove / replace 清单落地
-3. 外部执行器接口抽象
-4. `leader-graph` 主路径与本地执行栈解耦
-
-## 历史说明
-
-此前的“第一阶段 / 第二阶段”工作仍然有价值，但它们现在属于**历史验证资产**，不是新的产品方向本身。那些工作回答的是“治理层语义是否成立”，而不是“是否应该继续自建完整执行平台”。

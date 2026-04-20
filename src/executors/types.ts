@@ -3,16 +3,27 @@ import type { Artifact, ArtifactKind, NextAction, RiskLevel, RiskSignal, Role, T
 export type ExecutorPhase = 'developing' | 'testing';
 export type ExecutorRunState = 'submitted' | 'running' | 'completed' | 'blocked' | 'failed';
 export type ExecutionRole = Exclude<Role, 'leader'>;
+export type ExecutorProgressKind = 'status' | 'action' | 'observation' | 'warning' | 'error';
+
+export interface ExecutorProgressEvent {
+  executor: string;
+  phase: ExecutorPhase;
+  kind: ExecutorProgressKind;
+  message: string;
+  raw?: string;
+}
 
 export interface ExecutorTaskInput {
   taskId: string;
   taskSummary: string;
   phase: ExecutorPhase;
   currentStatus: TaskState;
+  workspaceRoot: string;
   artifacts: Artifact[];
   contextSummary: string;
   riskSignals: RiskSignal[];
   requestedOutcome: string;
+  onProgress?: (event: ExecutorProgressEvent) => void;
 }
 
 export interface ExecutorSubmission {

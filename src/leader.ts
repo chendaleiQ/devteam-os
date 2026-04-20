@@ -9,25 +9,18 @@ import {
   createId,
   setWaitingSummary
 } from './artifacts.js';
-import type { ExternalExecutor } from './executors/index.js';
+import type { ExecutorProgressEvent, ExternalExecutor } from './executors/index.js';
 import { runLeaderGraph } from './leader-graph.js';
-import type { LlmProviderConfig } from './llm/index.js';
-import { createSafeScriptRunner, type SafeScriptRunner } from './runner.js';
 import type { TaskStore } from './storage.js';
 
 export interface LeaderRunOptions {
-  executionBackend?: 'legacy' | 'external';
   executor?: string | ExternalExecutor;
   forceMeeting?: boolean;
   forceOwnerDecision?: boolean;
   forceBlocked?: boolean;
   workspaceRoot?: string;
   store?: TaskStore;
-  runner?: SafeScriptRunner;
-  verificationScripts?: string[];
-  repoConfigVerificationScript?: string;
-  packageJsonPath?: string;
-  llm?: LlmProviderConfig;
+  onProgress?: (event: ExecutorProgressEvent) => void;
 }
 
 export interface LeaderResumeOptions extends LeaderRunOptions {
@@ -36,11 +29,18 @@ export interface LeaderResumeOptions extends LeaderRunOptions {
 
 const WORKSPACE_ENV_KEYS = [
   'DEVTEAM_EXECUTOR',
-  'DEVTEAM_LLM_PROVIDER',
-  'DEVTEAM_LLM_MODEL',
-  'OPENAI_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_BASE_URL'
+  'DEVTEAM_OPENHANDS_COMMAND',
+  'DEVTEAM_OPENHANDS_HOME',
+  'MINIMAX_API_KEY',
+  'MINIMAX_MODEL',
+  'MINIMAX_BASE_URL',
+  'LLM_API_KEY',
+  'LLM_MODEL',
+  'LLM_BASE_URL',
+  'OPENHANDS_PERSISTENCE_DIR',
+  'OPENHANDS_CONVERSATIONS_DIR',
+  'OPENHANDS_WORK_DIR',
+  'OPENHANDS_SUPPRESS_BANNER'
 ] as const;
 
 export async function runLeaderTask(input: string, options: LeaderRunOptions = {}): Promise<LeaderRunResult> {
@@ -241,5 +241,4 @@ function loadWorkspaceEnv(workspaceRoot: string | undefined): void {
   });
 }
 
-export { createSafeScriptRunner };
-export type { SafeScriptRunner, ApprovalRequest, StateTransition };
+export type { ApprovalRequest, StateTransition };
